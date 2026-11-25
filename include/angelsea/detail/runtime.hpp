@@ -92,6 +92,7 @@ static constexpr asPWORD asea_offset_ctx_status     = offsetof(asCContext, m_sta
 static constexpr asPWORD asea_offset_ctx_currentfn  = offsetof(asCContext, m_currentFunction);
 static constexpr asPWORD asea_offset_ctx_stackindex = offsetof(asCContext, m_stackIndex);
 static constexpr asPWORD asea_offset_ctx_engine     = offsetof(asCContext, m_engine);
+static constexpr asPWORD asea_offset_ctx_callingsystemfunction = offsetof(asCContext, m_callingSystemFunction);
 
 static constexpr asPWORD asea_offset_scriptfn_scriptdata = offsetof(asCScriptFunction, scriptData);
 static constexpr asPWORD asea_offset_scriptdata_jitfunction

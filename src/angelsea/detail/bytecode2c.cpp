@@ -70,9 +70,18 @@ void BytecodeToC::translate_function(std::string_view internal_module_name, asIS
 	}
 
 	if (m_config->c.human_readable) {
-		const char* section_name;
-		int         row, col;
+		const char* section_name = nullptr;
+		int         row = 0, col = 0;
+#if ANGELSCRIPT_VERSION < 23800
+		// Before 2.38, GetDeclaredAt indexes the section names with scriptSectionIdx even when it is -1
+		// (compiler-generated functions), which reads out of bounds.
+		const auto& script_fn = static_cast<const asCScriptFunction&>(fn);
+		if (script_fn.scriptData != nullptr && script_fn.scriptData->scriptSectionIdx >= 0) {
+			fn.GetDeclaredAt(&section_name, &row, &col);
+		}
+#else
 		fn.GetDeclaredAt(&section_name, &row, &col);
+#endif
 		emit(
 		    "/* {}:{}:{}: {} */\n",
 		    section_name != nullptr ? section_name : "<anon>",
@@ -1555,6 +1564,8 @@ void BytecodeToC::emit_system_call(FnState& state, SystemCall call) {
 				emit("\t\tasea_call_object_method(_regs, {}, {});\n", call.object_pointer_override, call.fn_idx);
 			}
 		}
+
+		emit_leave_system_call(state);
 	};
 
 	// TODO: move this logic in its own function
@@ -1573,6 +1584,34 @@ void BytecodeToC::emit_system_call(FnState& state, SystemCall call) {
 	emit("#else\n");
 	emit_for_abi(AbiMask::GENERIC);
 	emit("#endif\n");
+}
+
+void BytecodeToC::emit_enter_system_call(std::string_view fn_desc_symbol) {
+	emit(
+	    "\t\t{{\n"
+	    "\t\t\textern void {FNDESC};\n"
+	    "\t\t\t*(void**)((char*)regs->ctx + {OFF_CALLING}) = &{FNDESC};\n"
+	    "\t\t}}\n",
+	    fmt::arg("FNDESC", fn_desc_symbol),
+	    fmt::arg("OFF_CALLING", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_callingsystemfunction))
+	);
+}
+
+void BytecodeToC::emit_leave_system_call(FnState& state) {
+	// An application function may have raised a script exception or aborted the context. The VM stops at the next
+	// instruction when the context is no longer active; code running here has to do the same, or it goes on with
+	// whatever the callee returned (a null reference after an out of bounds access).
+	state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
+	emit(
+	    "\t\t*(void**)((char*)regs->ctx + {OFF_CALLING}) = 0;\n"
+	    "\t\tif (*(int*)((char*)regs->ctx + {OFF_STATUS}) != asEXECUTION_ACTIVE) {{\n"
+	    "\t\t\tregs->pc = base_pc + {NEXT_OFFSET};\n"
+	    "\t\t\tgoto vm;\n"
+	    "\t\t}}\n",
+	    fmt::arg("OFF_CALLING", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_callingsystemfunction)),
+	    fmt::arg("OFF_STATUS", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_status)),
+	    fmt::arg("NEXT_OFFSET", state.ins.offset + state.ins.size())
+	);
 }
 
 BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call(FnState& state, SystemCall call, AbiMask abi) {
@@ -2043,6 +2082,8 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_native(
 		final_callable_name = fn_callable_symbol;
 	}
 
+	emit_enter_system_call(fn_desc_symbol);
+
 	// perform the actual call. the expression to perform the call is always the same but the surrounding call to
 	// figure out where to store the return value differs.
 	std::string call_expression = fmt::format("{FN}(", fmt::arg("FN", final_callable_name));
@@ -2178,11 +2219,13 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_generic(
 	const internalCallConv icc = sys_fn.callConv;
 
 	if (!call.is_internal_call) {
+#if ANGELSCRIPT_VERSION >= 23800 // variadic functions were added in 2.38.0
 		if (fn.IsVariadic()) {
 			// TODO: variadics are a bit annoying to support; certainly viable but they're so rare that other than
 			// full AOT i don't see the point to support them
 			return {.ok = false, .fail_reason = "Direct generic call failed: Variadics not supported yet"};
 		}
+#endif
 
 		if (sys_fn.returnAutoHandle && m_script_engine->ep.genericCallMode == 1) {
 			return {.ok = false, .fail_reason = "Direct generic call failed: Auto handles not supported yet"};
@@ -2254,6 +2297,7 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_generic(
 		);
 	}
 
+	emit_enter_system_call(fn_desc_symbol);
 	emit("\t\t{FNCALLABLE}(&g);\n", fmt::arg("FNCALLABLE", fn_callable_symbol));
 
 	if (!call.is_internal_call) {

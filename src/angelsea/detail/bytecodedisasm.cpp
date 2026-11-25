@@ -22,6 +22,10 @@ std::string disassemble(asIScriptEngine& engine, InsRef instruction) {
 
 		angelsea_assert(func != nullptr);
 
+		if (func == nullptr) {
+			return fmt::format("{} <unknown function {}>", instruction.info().name, instruction.int0());
+		}
+
 		return fmt::format(
 		    "{} {} # {}",
 		    instruction.info().name,

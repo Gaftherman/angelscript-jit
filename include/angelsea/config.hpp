@@ -151,7 +151,10 @@ struct JitConfig {
 	/// Do not update the program pointer, stack pointer and the stack frame pointers on direct system function calls
 	/// and some other scenarios. This breaks callees that may rely on the debug interface to inspect script state, but
 	/// is safe otherwise.
-	bool hack_ignore_context_inspect = true;
+	///
+	/// Disabled by default: an application function that raises a script exception (an out of bounds array access,
+	/// for example) reads the program pointer to report the line and the call stack, so the pointer has to be right.
+	bool hack_ignore_context_inspect = false;
 
 	/// Speeds up script calls by replacing complex call runtime logic with code generation. Does not enable inlining
 	/// yet. This is subject to breakage with AngelScript updates.

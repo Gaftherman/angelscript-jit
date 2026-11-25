@@ -1,11 +1,52 @@
-# angelsea
+# angelscript-jit
 
 > [!IMPORTANT]
-> Angelsea is alpha quality software.
+> This is a fork of [asumagic/angelsea](https://github.com/asumagic/angelsea) (BSD-2-Clause). It is alpha quality
+> software, like upstream.
 
-Angelsea is a **JIT compiler for AngelScript** written in C++20 which leverages
-the lightweight [MIR](https://github.com/vnmakarov/mir) JIT runtime and its C11
-compiler.
+A **JIT compiler for AngelScript** written in C++20 which leverages the
+lightweight [MIR](https://github.com/vnmakarov/mir) JIT runtime and its C11
+compiler. The library, the CMake target (`angelsea`) and the C++ namespace keep
+their upstream names, so changes can go back upstream.
+
+## What this fork adds
+
+The fork exists to keep the JIT working on the **current AngelScript release**
+and to test it on the earlier ones that have the `asIJITCompilerV2` interface.
+
+| AngelScript | Catch2 suite | Differential test | Notes |
+|-------------|--------------|-------------------|-------|
+| 2.39.0 (default, vendored) | ✅ | ✅ | |
+| 2.38.0      | ✅ | ✅ | The version upstream pins. |
+| 2.37.0      | ✅ | ✅ | Needed two fixes, see below. Earlier releases have no `asIJITCompilerV2`. |
+
+Tested on Windows x86-64 (MSVC) and Linux x86-64 (gcc). Linux and macOS arm64
+run in CI as experimental jobs.
+
+Changes over upstream:
+
+- **Script exceptions raised by application functions are no longer lost.**
+  `CScriptArray::At` (an out of bounds index) and any other function that calls
+  `asIScriptContext::SetException` were ignored in direct system calls, because
+  the JIT never set `m_callingSystemFunction`, which `SetException` requires.
+  The script then went on with the null reference the callee returned and
+  crashed. The JIT now sets and clears it around direct calls and, like the VM,
+  returns as soon as the context is no longer active.
+- `hack_ignore_context_inspect` is **off** by default, so the program pointer is
+  saved before direct calls and exceptions report the right line and call stack.
+  Turn it on for speed if your application functions never raise script
+  exceptions or inspect the context.
+- AngelScript 2.37 builds again: `asCScriptFunction::IsVariadic` is 2.38+, and
+  2.37's `GetDeclaredAt` reads out of bounds for functions without a section,
+  which crashed with `JitConfig::c.human_readable`.
+- A **differential test** (`tests/differential`): every script runs once on the
+  plain VM and once with the JIT, and the printed output, final state and
+  exception (with its line) must be identical. `generate.py --seed N` writes
+  random programs (integer and floating-point arithmetic, loops, recursion,
+  classes and interfaces, arrays and strings, try/catch), so a failure can be
+  reproduced from the seed.
+- CI runs both suites against 2.37, 2.38 and 2.39.
+- The `mir` submodule URL is absolute, so the fork builds without a fork of MIR.
 
 ## Current status
 
@@ -64,16 +105,16 @@ a certain bytecode size as a heuristic, which you can adjust.
 Start by cloning the repository itself:
 
 ```bash
-git clone https://github.com/asumagic/angelsea.git
-cd angelsea
+git clone --recurse-submodules https://github.com/Gaftherman/angelscript-jit.git
+cd angelscript-jit
 ```
 
 Or, if you want to vendor it as a Git submodule to your repository:
 
 ```bash
 cd whatever/vendor/directory/
-git submodule add https://github.com/asumagic/angelsea.git
-cd angelsea
+git submodule add https://github.com/Gaftherman/angelscript-jit.git
+cd angelscript-jit
 ```
 
 **Example project:** [`example/hello/`](example/hello)

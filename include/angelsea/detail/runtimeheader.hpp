@@ -201,6 +201,7 @@ constexpr const char* angelsea_c_header_offsets =
 extern const asPWORD asea_offset_ctx_status;
 extern const asPWORD asea_offset_ctx_currentfn;
 extern const asPWORD asea_offset_ctx_stackindex;
+extern const asPWORD asea_offset_ctx_callingsystemfunction;
 )___";
 
 } // namespace angelsea::detail

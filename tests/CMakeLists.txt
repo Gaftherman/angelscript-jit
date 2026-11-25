@@ -42,3 +42,14 @@ catch_discover_tests(
 	angelsea-tests
 	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# Differential host: the same script on the plain VM and on angelsea, outputs must match.
+add_executable(angelsea-differential differential/main.cpp)
+target_link_libraries(angelsea-differential PRIVATE asea_angelscript_internal angelsea angelscript-addons)
+# The scripts of the Catch2 suite hold several test functions each, so --all runs every `void f()`. abi.as and
+# bc_pga_var_test.as need functions that only the Catch2 host registers, and fib.as has no entry point of its own.
+set(differential_scripts bfint classinheritance devirt enums funcdefs functions globals globalswithclasses
+	refprimitives sharedfuncs stringmanip switch typedefs userclasses vec3f)
+list(TRANSFORM differential_scripts PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/scripts/")
+list(TRANSFORM differential_scripts APPEND ".as")
+add_test(NAME differential COMMAND angelsea-differential --all ${differential_scripts})

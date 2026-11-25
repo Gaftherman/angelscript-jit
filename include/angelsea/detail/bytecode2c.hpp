@@ -265,6 +265,16 @@ class BytecodeToC {
 	/// `abi` must refer to a single ABI, the caller should take care of #ifdef dispatch in case of multiple ABIs.
 	[[nodiscard]] SystemCallEmitResult emit_direct_system_call(FnState& state, SystemCall call, AbiMask abi);
 
+	/// Emit code that tells the context which system function is about to run (`m_callingSystemFunction`), as the
+	/// VM does. `asIScriptContext::SetException` refuses to raise anything unless it is set, so without it an
+	/// application function that reports an error (an out of bounds array access, for example) is ignored silently.
+	/// \ref emit_leave_system_call clears it again once the call has returned.
+	void emit_enter_system_call(std::string_view fn_desc_symbol);
+
+	/// Emit code that clears `m_callingSystemFunction` after a direct system call and stops the JIT function when the
+	/// callee left the context in a state other than active (exception, abort, suspend), as the VM does.
+	void emit_leave_system_call(FnState& state);
+
 	/// Emit code to perform a direct system call (i.e. with a known signature and target), assuming it is of any of the
 	/// native calling conventions. On failure, no code is emitted and the returned result object sets `ok == false`.
 	/// `abi` must refer to a single ABI, the caller should take care of #ifdef dispatch in case of multiple ABIs.
