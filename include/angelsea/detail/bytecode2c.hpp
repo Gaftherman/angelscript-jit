@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -113,6 +114,21 @@ class BytecodeToC {
 		ERR_NULL            = 1 << 1,
 		ERR_DIVIDE_BY_ZERO  = 1 << 2,
 		ERR_DIVIDE_OVERFLOW = 1 << 3,
+		ERR_POW_OVERFLOW    = 1 << 4,
+	};
+
+	enum class PromotedLocalKind : std::uint8_t {
+		U32,
+		F32,
+		U64,
+		F64,
+		PWORD,
+	};
+
+	struct PromotedLocal {
+		int               offset;
+		PromotedLocalKind kind;
+		bool              is_written;
 	};
 
 	struct FnState {
@@ -142,7 +158,11 @@ class BytecodeToC {
 		/// Symbols that already have been emitted, to avoid duplicated declarations
 		std::unordered_set<std::string> emitted_symbols; // (might be good to find a way to remove?)
 
+		/// Promoted frame offsets mapped to their scalar C local metadata (ordered by offset for deterministic codegen).
+		std::map<int, PromotedLocal> promoted_locals;
+
 		bool has_direct_generic_call;
+		bool in_system_call = false;
 
 		std::underlying_type_t<ErrorHandler> error_handlers_mask;
 	};
@@ -211,6 +231,15 @@ class BytecodeToC {
 
 	/// Discover peephole optimizations to populate the virtual instructions.
 	void discover_peephole(FnState& state);
+
+	/// Scans the function's variables and bytecode to determine which frame offsets can be promoted to C locals.
+	void discover_register_locals(FnState& state);
+
+	void emit_register_local_declarations(const FnState& state);
+	void emit_spill_all(const FnState& state);
+	void emit_reload_all(const FnState& state);
+	void emit_spill_lines_to(std::string& target, const FnState& state, std::string_view indent);
+	void emit_reload_lines_to(std::string& target, const FnState& state, std::string_view indent);
 
 	void emit_entry_dispatch(FnState& state);
 	void emit_error_handlers(FnState& state);
@@ -353,6 +382,10 @@ class BytecodeToC {
 	/// regular binop because these instructions can raise exceptions.
 	void emit_divmod_var_float_ins(FnState& state, std::string_view op, VarType type);
 
+	/// `**` on variables. Floating point results raise the VM's overflow exception when they are infinite; integer ones
+	/// call the runtime (\p fn) and raise it when the runtime reports an overflow.
+	void emit_pow_var_ins(FnState& state, VarType lhs, VarType rhs, VarType dst, std::string_view fn);
+
 	/// Emits the complete handler for a division or modulus operation (where `op` is `/` or `%`) between two integral
 	/// variables on the stack, outputting to a third one. This is handled separately from regular binop because these
 	/// instructions can raise exceptions.
@@ -368,6 +401,12 @@ class BytecodeToC {
 	std::string frame_ptr(std::string_view expr);
 	std::string frame_ptr(int offset);
 
+	std::string          promoted_local_name(int offset) const;
+	const PromotedLocal* find_promoted_local(int offset) const;
+	std::string          frame_var_mem(int offset, VarType type);
+	std::string          read_frame_var(FnState& state, int offset, VarType type, std::string_view tmp_name);
+	void                 emit_write_frame_var(FnState& state, int offset, VarType type, std::string_view src_expr);
+
 	std::string frame_var(std::string_view expr, VarType type);
 	std::string frame_var(int offset, VarType type);
 
@@ -376,6 +415,7 @@ class BytecodeToC {
 	const JitConfig* m_config;
 	asCScriptEngine* m_script_engine;
 	std::string      m_c_symbol_prefix;
+	const FnState*   m_active_fn_state = nullptr;
 
 	OnMapFunctionCallback m_on_map_function_callback;
 	OnMapExternCallback   m_on_map_extern_callback;
@@ -429,11 +469,12 @@ inline VarType BytecodeToC::make_local_from_operand(FnState& state, std::string_
 	    },
 	    [&](const operands::FrameVariable& v) {
 		    // FIXME: can't handle fp yet
+		    const std::string rhs = read_frame_var(state, v.idx, v.type, fmt::format("{}_bitcast", name));
 		    emit(
 		        "\t\t{TYPE} {NAME} = {VAR};\n",
 		        fmt::arg("TYPE", v.type.c),
 		        fmt::arg("NAME", name),
-		        fmt::arg("VAR", frame_var(v.idx, v.type))
+		        fmt::arg("VAR", rhs)
 		    );
 		    return v.type;
 	    },

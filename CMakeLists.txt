@@ -47,6 +47,13 @@ else()
 endif()
 
 # Configure MIR build
+# MIR has no 32-bit backend: there only the AOT path is built (export the C, compile it, load it)
+if (CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(_asea_no_mir_default ON)
+else()
+    set(_asea_no_mir_default OFF)
+endif()
+option(ASEA_NO_MIR "Build without MIR: no runtime compiler, AOT libraries only (default on 32-bit targets)" ${_asea_no_mir_default})
 # Upstream CMakeLists doesn't allow us from excluding tests and such
 option(ASEA_MIR_SYSTEM "Disable building of vendored MIR. Make sure to provide -DASEA_MIR_ROOT" OFF)
 
@@ -56,7 +63,7 @@ set(
     CACHE STRING
     "Root path to MIR for includes (and sources when -DASEA_MIR_SYSTEM=0)"
 )
-if (ASEA_MIR_SYSTEM)
+if (ASEA_NO_MIR OR ASEA_MIR_SYSTEM)
     add_library(asea_mir INTERFACE)
     target_include_directories(asea_mir INTERFACE ${ASEA_MIR_ROOT})
 else()
@@ -118,13 +125,17 @@ endif()
 add_library(angelsea STATIC
     src/angelsea/jit.cpp
     src/angelsea/fnconfig.cpp
+    src/angelsea/detail/aot.cpp
     src/angelsea/detail/mirjit.cpp
     src/angelsea/detail/runtime.cpp
     src/angelsea/detail/bytecode2c.cpp
     src/angelsea/detail/bytecodedisasm.cpp
 )
-target_link_libraries(angelsea PRIVATE ${ASEA_FMT_TARGET} asea_mir asea_angelscript_internal)
+target_link_libraries(angelsea PRIVATE ${ASEA_FMT_TARGET} asea_mir asea_angelscript_internal ${CMAKE_DL_LIBS})
 target_include_directories(angelsea PUBLIC include/)
+if (ASEA_NO_MIR)
+    target_compile_definitions(angelsea PUBLIC ASEA_NO_MIR=1)
+endif()
 target_compile_features(angelsea PUBLIC cxx_std_20)
 
 if(ASEA_NO_DEBUG)

@@ -49,8 +49,8 @@ target_link_libraries(angelsea-differential PRIVATE asea_angelscript_internal an
 # The scripts of the Catch2 suite hold several test functions each, so --all runs every `void f()`. abi.as and
 # bc_pga_var_test.as need functions that only the Catch2 host registers, and fib.as has no entry point of its own.
 set(differential_scripts bfint classinheritance devirt enums funcdefs functions globals globalswithclasses
-	refprimitives sharedfuncs stringmanip switch typedefs unalignedfields userclasses vec3f deeprecursion nullcalls)
+	refprimitives sharedfuncs stringmanip switch typedefs unalignedfields userclasses vec3f deeprecursion nullcalls misc_ops pow_ops)
 list(TRANSFORM differential_scripts PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/scripts/")
 list(TRANSFORM differential_scripts APPEND ".as")
-add_custom_target(angelsea-bench COMMAND angelsea-differential --time 3 ${CMAKE_CURRENT_SOURCE_DIR}/bench/fib.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/loops.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/sieve.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/nbody.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/objects.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/strings.as DEPENDS angelsea-differential USES_TERMINAL)
+add_custom_target(angelsea-bench COMMAND angelsea-differential --time 3 ${CMAKE_CURRENT_SOURCE_DIR}/bench/fib.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/loops.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/sieve.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/nbody.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/objects.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/strings.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/matmul.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/virtual.as ${CMAKE_CURRENT_SOURCE_DIR}/bench/closures.as DEPENDS angelsea-differential USES_TERMINAL)
 add_test(NAME differential COMMAND angelsea-differential --all ${differential_scripts})

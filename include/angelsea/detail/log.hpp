@@ -4,6 +4,7 @@
 
 #include <angelscript.h>
 #include <angelsea/config.hpp>
+#include <angelsea/detail/compat.hpp>
 #include <fmt/format.h>
 #include <utility>
 
@@ -74,7 +75,7 @@ void log(
 ) {
 	const char* decl_section;
 	int         decl_row, decl_col;
-	script_func.GetDeclaredAt(&decl_section, &decl_row, &decl_col);
+	detail::get_declared_at(script_func, &decl_section, &decl_row, &decl_col);
 	log_at(
 	    config,
 	    engine,

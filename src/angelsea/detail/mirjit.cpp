@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <angelscript.h>
+#include <angelsea/detail/aot.hpp>
 #include <angelsea/detail/bytecode2c.hpp>
 #include <angelsea/detail/bytecodeinstruction.hpp>
 #include <angelsea/detail/bytecodetools.hpp>
@@ -12,16 +13,37 @@
 #include <as_generic.h>
 #include <bit>
 #include <cmath>
+#include <fstream>
+#if !ASEA_NO_MIR
 #include <mir-gen.h>
 #include <mir.h>
+#endif
 #include <string>
 #include <unordered_map>
 
 namespace angelsea::detail {
 
+#if !ASEA_NO_MIR
 Mir::Mir(MIR_alloc_t alloc, MIR_code_alloc_t code_alloc) : m_ctx(MIR_init2(alloc, code_alloc)) {}
 Mir::~Mir() { MIR_finish(m_ctx); }
+#endif
 
+/// Installs callback as the function-level JIT entry point. Releases before 2.37 have no SetJITFunction; the engine
+/// reads scriptData->jitFunction directly in asBC_JitEntry, so writing it is equivalent.
+static int set_jit_function(asIScriptFunction& function, asJITFunction callback) {
+#if ASEA_JIT_INTERFACE_V2
+	return function.SetJITFunction(callback);
+#else
+	auto& script_function = static_cast<asCScriptFunction&>(function);
+	if (script_function.scriptData == nullptr) {
+		return asERROR;
+	}
+	script_function.scriptData->jitFunction = callback;
+	return asSUCCESS;
+#endif
+}
+
+#if !ASEA_NO_MIR
 C2Mir::C2Mir(Mir& mir) : m_ctx(mir) { c2mir_init(m_ctx); }
 C2Mir::~C2Mir() { c2mir_finish(m_ctx); }
 
@@ -41,6 +63,12 @@ static void bind_runtime(Mir& mir) {
 	ASEA_BIND_MIR(asea_alloc);
 	ASEA_BIND_MIR(asea_free);
 	ASEA_BIND_MIR(asea_new_script_object);
+	ASEA_BIND_MIR(asea_powi);
+	ASEA_BIND_MIR(asea_powu);
+	ASEA_BIND_MIR(asea_powi64);
+	ASEA_BIND_MIR(asea_powu64);
+	MIR_load_external(mir, "pow", std::bit_cast<void*>(+[](double a, double b) { return pow(a, b); }));
+	MIR_load_external(mir, "powf", std::bit_cast<void*>(+[](float a, float b) { return powf(a, b); }));
 	MIR_load_external(mir, "memcpy", std::bit_cast<void*>(+[](void* dst, const void* src, std::size_t size) {
 		                  return std::memcpy(dst, src, size);
 	                  }));
@@ -49,6 +77,7 @@ static void bind_runtime(Mir& mir) {
 	MIR_load_external(mir, "fmodf", std::bit_cast<void*>(+[](float a, float b) { return fmodf(a, b); }));
 #undef ASEA_BIND_MIR
 }
+#endif // !ASEA_NO_MIR
 
 void jit_entry_function_counter(asSVMRegisters* regs, asPWORD lazy_fn_raw) {
 	if (lazy_fn_raw != 1) { // value 1 can be passed in direct JIT calls; ignore it
@@ -86,7 +115,9 @@ MirJit::MirJit(const JitConfig& config, asIScriptEngine& engine) :
     m_c_generator{m_config, *m_engine},
     m_ignore_unregister{nullptr},
     m_registered_engine_globals{false} {
+#if !ASEA_NO_MIR
 	bind_runtime(m_mir);
+#endif
 }
 
 MirJit::~MirJit() {
@@ -97,6 +128,11 @@ MirJit::~MirJit() {
 }
 
 void MirJit::register_function(asIScriptFunction& script_function) {
+#if ASEA_NO_MIR
+	// No runtime compiler on this target: functions stay in the VM until load_aot installs library code.
+	(void)script_function;
+	return;
+#else
 	if (!m_registered_engine_globals) {
 		bind_engine_globals(*script_function.GetEngine());
 		m_registered_engine_globals = true;
@@ -128,6 +164,7 @@ void MirJit::register_function(asIScriptFunction& script_function) {
 	} else {
 		setup_jit_callback(script_function, jit_entry_function_counter, lazy_fn, false);
 	}
+#endif
 }
 
 void MirJit::unregister_function(asIScriptFunction& script_function) {
@@ -159,7 +196,8 @@ void MirJit::unregister_function(asIScriptFunction& script_function) {
 	// can't unload modules from MIR AFAIK
 }
 
-void MirJit::bind_engine_globals(asIScriptEngine& engine) {
+void MirJit::bind_engine_globals([[maybe_unused]] asIScriptEngine& engine) {
+#if !ASEA_NO_MIR
 	MIR_load_external(m_mir, "asea_engine", &engine);
 
 	if (m_config.experimental_direct_generic_call) {
@@ -169,6 +207,7 @@ void MirJit::bind_engine_globals(asIScriptEngine& engine) {
 		void*      generic_vtable = *std::bit_cast<void**>(&generic);
 		MIR_load_external(m_mir, "asea_generic_vtable", generic_vtable);
 	}
+#endif
 }
 
 struct InputData {
@@ -193,6 +232,386 @@ static int c2mir_getc_callback(void* user_data) {
 	std::int8_t c = *info.current_ptr;
 	++info.current_ptr;
 	return c;
+}
+
+/// Hash of the instruction stream (opcode and size of each instruction): operands hold run-specific pointers, so they stay
+/// out of it.
+static unsigned long long opcode_hash(asIScriptFunction& fn) {
+	std::string stream;
+	for (InsRef ins : get_bytecode(fn)) {
+		stream += std::to_string(int(ins.opcode())) + ':' + std::to_string(ins.size()) + ';';
+	}
+	return aot_hash(stream);
+}
+
+static std::vector<std::string> split_tabs(const std::string& line) {
+	std::vector<std::string> columns;
+	std::size_t              begin = 0;
+	for (;;) {
+		const auto end = line.find('\t', begin);
+		columns.push_back(line.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+		if (end == std::string::npos) {
+			break;
+		}
+		begin = end + 1;
+	}
+	return columns;
+}
+
+std::size_t MirJit::load_aot(asIScriptModule& module, const char* library_path, const char* manifest_path) {
+	void* library = aot_open_library(library_path);
+	if (library == nullptr) {
+		return 0;
+	}
+	const auto* version      = static_cast<const int*>(aot_symbol(library, "asea_aot_version"));
+	void**      ext          = static_cast<void**>(aot_symbol(library, "asea_aot_ext"));
+	const auto* ext_names    = static_cast<const char* const*>(aot_symbol(library, "asea_aot_ext_names"));
+	const auto* ext_count    = static_cast<const unsigned*>(aot_symbol(library, "asea_aot_ext_count"));
+	const auto* fn_table     = static_cast<const AotFunctionEntry*>(aot_symbol(library, "asea_aot_functions"));
+	const auto* fn_count     = static_cast<const unsigned*>(aot_symbol(library, "asea_aot_function_count"));
+	if (version == nullptr || ext == nullptr || ext_names == nullptr || ext_count == nullptr || fn_table == nullptr
+	    || fn_count == nullptr || *version != ANGELSCRIPT_VERSION) {
+		return 0;
+	}
+
+	struct ManifestExtern {
+		std::string kind, key, id;
+	};
+	struct ManifestFunction {
+		std::string decl, hash, entries;
+	};
+	std::unordered_map<std::string, ManifestExtern>   externs;
+	std::unordered_map<std::string, ManifestFunction> manifest_functions;
+	{
+		std::ifstream in(manifest_path, std::ios::binary);
+		if (!in) {
+			return 0;
+		}
+		std::string line;
+		while (std::getline(in, line)) {
+			const auto columns = split_tabs(line);
+			if (columns.size() < 3) {
+				continue;
+			}
+			if (columns[1] == "function") {
+				manifest_functions[columns[0]]
+				    = {columns[2], columns.size() > 3 ? columns[3] : "", columns.size() > 4 ? columns[4] : ""};
+			} else if (columns[1] != "version") {
+				externs[columns[0]] = {columns[1], columns[2], columns.size() > 3 ? columns[3] : ""};
+			}
+		}
+	}
+
+	// every function and method of the module, by declaration
+	std::unordered_map<std::string, asIScriptFunction*> module_functions;
+	for (asUINT i = 0; i < module.GetFunctionCount(); ++i) {
+		asIScriptFunction* f = module.GetFunctionByIndex(i);
+		module_functions[f->GetDeclaration(true, true, true)] = f;
+	}
+	for (asUINT t = 0; t < module.GetObjectTypeCount(); ++t) {
+		asITypeInfo* type = module.GetObjectTypeByIndex(t);
+		for (asUINT m = 0; m < type->GetMethodCount(); ++m) {
+			asIScriptFunction* f = type->GetMethodByIndex(m, false);
+			module_functions[f->GetDeclaration(true, true, true)] = f;
+		}
+	}
+
+	// every engine function by declaration, preferring the ones of this module
+	auto*                                               engine = static_cast<asCScriptEngine*>(m_engine);
+	std::unordered_map<std::string, asCScriptFunction*> engine_functions;
+	for (asUINT i = 0; i < engine->scriptFunctions.GetLength(); ++i) {
+		asCScriptFunction* f = engine->scriptFunctions[i];
+		if (f == nullptr) {
+			continue;
+		}
+		const std::string decl = f->GetDeclaration(true, true, true);
+		if (f->GetModule() == &module || engine_functions.find(decl) == engine_functions.end()) {
+			engine_functions[decl] = f;
+		}
+	}
+
+	void* generic_vtable = nullptr;
+	{
+		asCGeneric generic{nullptr, nullptr, nullptr, nullptr};
+		generic_vtable = *std::bit_cast<void**>(&generic);
+	}
+	const std::unordered_map<std::string, void*> builtins = {
+	    {"asea_call_script_function", std::bit_cast<void*>(&asea_call_script_function)},
+	    {"asea_call_system_function", std::bit_cast<void*>(&asea_call_system_function)},
+	    {"asea_call_object_method", std::bit_cast<void*>(&asea_call_object_method)},
+	    {"asea_prepare_script_stack", std::bit_cast<void*>(&asea_prepare_script_stack)},
+	    {"asea_prepare_script_stack_and_vars", std::bit_cast<void*>(&asea_prepare_script_stack_and_vars)},
+	    {"asea_debug_message", std::bit_cast<void*>(&asea_debug_message)},
+	    {"asea_debug_int", std::bit_cast<void*>(&asea_debug_int)},
+	    {"asea_set_internal_exception", std::bit_cast<void*>(&asea_set_internal_exception)},
+	    {"asea_clean_args", std::bit_cast<void*>(&asea_clean_args)},
+	    {"asea_cast", std::bit_cast<void*>(&asea_cast)},
+	    {"asea_resolve_virtual_function", std::bit_cast<void*>(&asea_resolve_virtual_function)},
+	    {"asea_alloc", std::bit_cast<void*>(&asea_alloc)},
+	    {"asea_free", std::bit_cast<void*>(&asea_free)},
+	    {"asea_new_script_object", std::bit_cast<void*>(&asea_new_script_object)},
+	    {"asea_powi", std::bit_cast<void*>(&asea_powi)},
+	    {"asea_powu", std::bit_cast<void*>(&asea_powu)},
+	    {"asea_powi64", std::bit_cast<void*>(&asea_powi64)},
+	    {"asea_powu64", std::bit_cast<void*>(&asea_powu64)},
+	    {"asea_generic_vtable", generic_vtable},
+	    {"asea_engine", m_engine},
+	};
+
+	// resolve into a scratch table so that a failure leaves the library untouched
+	std::vector<void*> resolved(*ext_count, nullptr);
+	for (unsigned i = 0; i < *ext_count; ++i) {
+		const std::string name = ext_names[i];
+		if (auto b = builtins.find(name); b != builtins.end()) {
+			resolved[i] = b->second;
+			continue;
+		}
+		const auto m = externs.find(name);
+		if (m == externs.end()) {
+			return 0;
+		}
+		const auto& [kind, key, export_id] = m->second;
+		void* value             = nullptr;
+		if (kind == "bytecode") {
+			if (auto f = module_functions.find(key); f != module_functions.end()) {
+				value = f->second->GetByteCode();
+			} else if (auto e = engine_functions.find(key); e != engine_functions.end()) {
+				value = e->second->GetByteCode(); // callee of another module or an application generated function
+			}
+		} else if (kind == "global") {
+			for (asUINT g = 0; g < module.GetGlobalVarCount() && value == nullptr; ++g) {
+				const char* g_name = nullptr;
+				const char* g_ns   = nullptr;
+				module.GetGlobalVar(g, &g_name, &g_ns);
+				if (std::string{g_ns != nullptr ? g_ns : ""} + "::" + g_name == key) {
+					// the address of the property's storage, as the engine's address map has it: for an object variable
+					// that is the slot that holds the object pointer, which GetAddressOfGlobalVar would dereference
+					value = ASEA_MODULE_GLOBALS(static_cast<asCModule&>(module)).Get(g)->GetAddressOfValue();
+				}
+			}
+		} else if (kind == "string") {
+#if ANGELSCRIPT_VERSION >= 23200 // asIStringFactory appeared in 2.32; before it string constants cannot be exported
+			asIStringFactory* factory = engine->stringFactory;
+			if (factory != nullptr) {
+				std::string data;
+				for (std::size_t c = 0; c + 1 < key.size(); c += 2) {
+					data += char(std::stoi(key.substr(c, 2), nullptr, 16));
+				}
+				value = const_cast<void*>(factory->GetStringConstant(data.data(), asUINT(data.size())));
+			}
+#endif
+		} else if (kind == "script_function" || kind == "system_function") {
+			if (auto f = engine_functions.find(key); f != engine_functions.end()) {
+				if (std::getenv("ASEA_AOT_DEBUG") != nullptr) {
+					std::fprintf(stderr, "aot %s %s export_id=%s id=%d\n", name.c_str(), key.c_str(), export_id.c_str(), f->second->id);
+				}
+				value = kind == "script_function"
+				            ? static_cast<void*>(f->second)
+				            : (f->second->sysFuncIntf != nullptr ? std::bit_cast<void*>(f->second->sysFuncIntf->func)
+				                                                 : nullptr);
+			}
+		} else if (kind == "type") {
+			value = m_engine->GetTypeInfoByDecl(key.c_str());
+		}
+		if (value == nullptr) {
+			return 0;
+		}
+		resolved[i] = value;
+	}
+
+	// plan the installs before touching anything
+	struct Install {
+		asIScriptFunction*       fn;
+		void*                    entry;
+		std::vector<asPWORD>     entries;
+	};
+	std::vector<Install> installs;
+	for (unsigned i = 0; i < *fn_count; ++i) {
+		const auto m = manifest_functions.find(fn_table[i].name);
+		if (m == manifest_functions.end()) {
+			continue;
+		}
+		const auto f = module_functions.find(m->second.decl);
+		if (f == module_functions.end() || std::to_string(opcode_hash(*f->second)) != m->second.hash) {
+			continue; // stale export: the function keeps running in the VM or in MIR
+		}
+		if (const char* only = std::getenv("ASEA_AOT_ONLY"); only != nullptr && m->second.decl.find(only) == std::string::npos) {
+			continue; // diagnosis: install only the functions whose declaration contains this text
+		}
+		Install install{f->second, fn_table[i].fn, {}};
+		for (std::size_t begin = 0; begin < m->second.entries.size();) {
+			const auto end = m->second.entries.find(',', begin);
+			install.entries.push_back(
+			    std::stoull(m->second.entries.substr(begin, end == std::string::npos ? std::string::npos : end - begin))
+			);
+			begin = end == std::string::npos ? m->second.entries.size() : end + 1;
+		}
+		installs.push_back(std::move(install));
+	}
+	if (installs.empty()) {
+		return 0;
+	}
+
+	for (unsigned i = 0; i < *ext_count; ++i) {
+		ext[i] = resolved[i];
+	}
+	for (const auto& install : installs) {
+		std::size_t k = 0;
+		for (InsRef ins : get_bytecode(*install.fn)) {
+			if (ins.opcode() == asBC_JitEntry && k < install.entries.size()) {
+				ins.pword0() = install.entries[k++];
+			}
+		}
+		m_lazy_functions.erase(install.fn);
+		m_ignore_unregister = install.fn;
+		set_jit_function(*install.fn, std::bit_cast<asJITFunction>(install.entry));
+		m_ignore_unregister = nullptr;
+	}
+	return installs.size();
+}
+
+bool MirJit::export_module_c(asIScriptModule& module, std::string& c_source, std::string& manifest) {
+	std::vector<asIScriptFunction*> functions;
+	for (asUINT i = 0; i < module.GetFunctionCount(); ++i) {
+		functions.push_back(module.GetFunctionByIndex(i));
+	}
+	for (asUINT t = 0; t < module.GetObjectTypeCount(); ++t) {
+		asITypeInfo* type = module.GetObjectTypeByIndex(t);
+		for (asUINT m = 0; m < type->GetMethodCount(); ++m) {
+			functions.push_back(type->GetMethodByIndex(m, false));
+		}
+	}
+
+	BytecodeToC                           generator{m_config, *m_engine, "asea_aot"};
+	std::unordered_map<std::string, bool> seen_externs;
+	std::string                           functions_manifest;
+	std::string                           externs_manifest;
+	std::size_t                           translated = 0;
+	std::vector<AotFunction>              exported;
+
+	generator.prepare_new_context();
+	generator.set_map_extern_callback([&](const char* c_name, const BytecodeToC::ExternMapping& mapping, void*) {
+		if (!seen_externs.emplace(c_name, true).second) {
+			return;
+		}
+		const char* kind = "";
+		std::string key;
+		std::string id; // engine function id at export time, only to diagnose a wrong resolution
+		std::visit(
+		    [&](const auto& m) {
+			    using T = std::decay_t<decltype(m)>;
+			    if constexpr (std::is_same_v<T, BytecodeToC::ExternBytecodeDefinition>) {
+				    kind = "bytecode";
+				    key  = m.fn->GetDeclaration(true, true, true);
+			    } else if constexpr (std::is_same_v<T, BytecodeToC::ExternGlobalVariable>) {
+				    kind = "global";
+				    if (m.property != nullptr) {
+					    key = std::string{m.property->nameSpace != nullptr ? m.property->nameSpace->name.AddressOf() : ""}
+					          + "::" + m.property->name.AddressOf();
+				    }
+			    } else if constexpr (std::is_same_v<T, BytecodeToC::ExternStringConstant>) {
+				    kind = "string";
+				    // hex of the characters, read back through the registered string factory
+#if ANGELSCRIPT_VERSION >= 23200
+				    asIStringFactory* factory = static_cast<asCScriptEngine*>(m_engine)->stringFactory;
+				    if (factory != nullptr) {
+					    asUINT length = 0;
+					    factory->GetRawStringData(m.ptr, nullptr, &length);
+					    std::string data(length, '\0');
+					    factory->GetRawStringData(m.ptr, data.data(), &length);
+					    static constexpr char digits[] = "0123456789abcdef";
+					    for (const unsigned char c : data) {
+						    key += digits[c >> 4];
+						    key += digits[c & 15];
+					    }
+				    }
+#else
+				    std::ignore = m;
+#endif
+			    } else if constexpr (std::is_same_v<T, BytecodeToC::ExternScriptFunction>) {
+				    kind = "script_function";
+				    id   = std::to_string(m.id);
+				    if (asIScriptFunction* f = m_engine->GetFunctionById(m.id)) {
+					    key = f->GetDeclaration(true, true, true);
+				    }
+			    } else if constexpr (std::is_same_v<T, BytecodeToC::ExternSystemFunction>) {
+				    kind = "system_function";
+				    id   = std::to_string(m.id);
+				    if (asIScriptFunction* f = m_engine->GetFunctionById(m.id)) {
+					    key = f->GetDeclaration(true, true, true);
+				    }
+			    } else if constexpr (std::is_same_v<T, BytecodeToC::ExternTypeInfo>) {
+				    kind = "type";
+				    if (m.object_type != nullptr) {
+					    key = m_engine->GetTypeDeclaration(m.object_type->GetTypeId(), true);
+				    }
+			    }
+		    },
+		    mapping
+		);
+		externs_manifest += std::string{c_name} + '\t' + kind + '\t' + key + '\t' + id + '\n';
+	});
+
+	for (asIScriptFunction* fn : functions) {
+		if (fn == nullptr || fn->GetFuncType() != asFUNC_SCRIPT) {
+			continue;
+		}
+		asUINT bytecode_length = 0;
+		fn->GetByteCode(&bytecode_length);
+		if (bytecode_length == 0 || bytecode_length * sizeof(asDWORD) > m_config.max_bytecode_bytes) {
+			continue;
+		}
+		std::string c_name;
+		generator.set_map_function_callback([&](asIScriptFunction&, const std::string& name) { c_name = name; });
+		// translation renumbers the JitEntry arguments of the live bytecode: put them back so the function still runs
+		std::vector<std::pair<asPWORD*, asPWORD>> jit_entry_args;
+		for (InsRef ins : get_bytecode(*fn)) {
+			if (ins.opcode() == asBC_JitEntry) {
+				jit_entry_args.emplace_back(&ins.pword0(), ins.pword0());
+			}
+		}
+		generator.translate_function(module.GetName(), *fn, FnConfig{});
+		// the numbers the translator gave to the entries, which the loader writes back in the same order
+		std::string entries;
+		for (InsRef ins : get_bytecode(*fn)) {
+			if (ins.opcode() == asBC_JitEntry) {
+				entries += (entries.empty() ? "" : ",") + std::to_string(ins.pword0());
+			}
+		}
+		for (const auto& [slot, value] : jit_entry_args) {
+			*slot = value;
+		}
+		functions_manifest += c_name + "\tfunction\t" + fn->GetDeclaration(true, true, true) + '\t'
+		                      + std::to_string(opcode_hash(*fn)) + '\t' + entries + '\n';
+		exported.push_back(AotFunction{c_name});
+		++translated;
+	}
+
+	if (translated == 0) {
+		return false;
+	}
+
+	TranspiledCode code = generator.finalize_context();
+	std::string    raw;
+	for (const char* block : code.source_bits) {
+		raw += block;
+	}
+
+	std::vector<std::string> table_symbols = {
+	    "asea_call_script_function", "asea_call_system_function", "asea_call_object_method",
+	    "asea_prepare_script_stack", "asea_prepare_script_stack_and_vars", "asea_debug_message", "asea_debug_int",
+	    "asea_set_internal_exception", "asea_clean_args", "asea_cast", "asea_resolve_virtual_function", "asea_alloc",
+	    "asea_free", "asea_new_script_object", "asea_powi", "asea_powu", "asea_powi64", "asea_powu64",
+	    "asea_generic_vtable", "asea_engine",
+	};
+	for (const auto& [name, unused] : seen_externs) {
+		table_symbols.push_back(name);
+	}
+	std::vector<std::string> used;
+	c_source = aot_redirect_externs(raw, table_symbols, exported, ANGELSCRIPT_VERSION, used);
+
+	manifest = "version\tversion\t" + std::to_string(ANGELSCRIPT_VERSION) + "\n" + functions_manifest + externs_manifest;
+	return true;
 }
 
 bool MirJit::translate_lazy_function(LazyMirFunction& fn) {
@@ -307,6 +726,7 @@ bool MirJit::translate_lazy_function(LazyMirFunction& fn) {
 }
 
 void MirJit::codegen_async_function(AsyncMirFunction& fn) {
+#if !ASEA_NO_MIR
 	Mir compile_mir;
 	{
 		C2Mir c2mir{compile_mir};
@@ -414,6 +834,7 @@ void MirJit::codegen_async_function(AsyncMirFunction& fn) {
 			}
 		}
 	} // must destroy C2Mir before MirJit potentially gets destroyed
+#endif // !ASEA_NO_MIR
 
 	{
 		std::unique_lock lk{m_async_finalize_mutex};
@@ -454,7 +875,7 @@ void MirJit::link_function(AsyncMirFunction& fn) {
 	}
 
 	m_ignore_unregister             = fn.script_function;
-	[[maybe_unused]] const auto err = fn.script_function->SetJITFunction(fn.compiled.jit_function);
+	[[maybe_unused]] const auto err = set_jit_function(*fn.script_function, fn.compiled.jit_function);
 	angelsea_assert(err == asSUCCESS);
 	m_ignore_unregister = nullptr;
 }
@@ -469,7 +890,7 @@ void MirJit::setup_jit_callback(asIScriptFunction& function, asJITFunction callb
 	if (ignore_unregister) {
 		m_ignore_unregister = &function;
 	}
-	function.SetJITFunction(callback);
+	set_jit_function(function, callback);
 	if (ignore_unregister) {
 		m_ignore_unregister = nullptr;
 	}

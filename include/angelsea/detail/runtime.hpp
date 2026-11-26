@@ -3,6 +3,7 @@
 #pragma once
 
 #include <angelscript.h>
+#include <angelsea/detail/compat.hpp>
 #include <as_context.h>
 #include <as_objecttype.h>
 #include <as_scriptobject.h>
@@ -89,6 +90,12 @@ void* asea_alloc(asQWORD size);
 [[gnu::hot]]
 void asea_free(void* ptr);
 
+/// Integer exponentiation of the VM (`as_powi` and friends); \p overflow is set when the result does not fit.
+int           asea_powi(int base, int exponent, int* overflow);
+asDWORD       asea_powu(asDWORD base, asDWORD exponent, int* overflow);
+asINT64       asea_powi64(asINT64 base, asINT64 exponent, int* overflow);
+asQWORD       asea_powu64(asQWORD base, asQWORD exponent, int* overflow);
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 // yes, it's not great to rely on offsetof given this is not a POD type; but AS does this all over the place and the
@@ -97,14 +104,21 @@ static constexpr asPWORD asea_offset_ctx_callstack  = offsetof(asCContext, m_cal
 static constexpr asPWORD asea_offset_ctx_status     = offsetof(asCContext, m_status);
 static constexpr asPWORD asea_offset_ctx_currentfn  = offsetof(asCContext, m_currentFunction);
 static constexpr asPWORD asea_offset_ctx_stackindex = offsetof(asCContext, m_stackIndex);
+static constexpr asPWORD asea_offset_ctx_stackblocks = offsetof(asCContext, m_stackBlocks);
 static constexpr asPWORD asea_offset_ctx_engine     = offsetof(asCContext, m_engine);
 static constexpr asPWORD asea_offset_ctx_callingsystemfunction = offsetof(asCContext, m_callingSystemFunction);
 
 static constexpr asPWORD asea_offset_scriptfn_scriptdata = offsetof(asCScriptFunction, scriptData);
+static constexpr asPWORD asea_offset_scriptfn_functype   = offsetof(asCScriptFunction, funcType);
 static constexpr asPWORD asea_offset_scriptdata_jitfunction
     = offsetof(asCScriptFunction::ScriptFunctionData, jitFunction);
 
-static constexpr asPWORD asea_offset_scriptobj_objtype = offsetof(asCScriptObject, objType);
+// objType is protected before 2.38; a derived type may name it
+struct asea_script_object_peek : asCScriptObject {
+	static asCObjectType* type_of(asCScriptObject* obj) { return static_cast<asea_script_object_peek*>(obj)->objType; }
+	static constexpr asPWORD objtype_offset() { return offsetof(asea_script_object_peek, objType); }
+};
+static constexpr asPWORD asea_offset_scriptobj_objtype = asea_script_object_peek::objtype_offset();
 
 static constexpr asPWORD asea_offset_objtype_vtable = offsetof(asCObjectType, virtualFunctionTable);
 #pragma GCC diagnostic pop

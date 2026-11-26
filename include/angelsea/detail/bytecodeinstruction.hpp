@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <angelscript.h>
+#include <angelsea/detail/compat.hpp>
 #include <angelsea/detail/debug.hpp>
 #include <array>
 #include <as_objecttype.h>
@@ -55,8 +56,8 @@ struct VarType {
 namespace var_types {
 static constexpr VarType s8{"asINT8", "asINT8", 1}, s16{"asINT16", "asINT16", 2}, s32{"asINT32", "asINT32", 4},
     s64{"asINT64", "asINT64", 8}, u8{"asBYTE", "asBYTE", 1}, u16{"asWORD", "asWORD", 2}, u32{"asDWORD", "asDWORD", 4},
-    u64{"asQWORD", "asQWORD", 8}, pword{"asPWORD", "asPWORD", 8 /* should never be used for this type anyway */},
-    void_ptr{"void*", "ptr", 8 /* same as pword */}, f32{"float", "float", 4}, f64{"double", "double", 8};
+    u64{"asQWORD", "asQWORD", 8}, pword{"asPWORD", "asPWORD", sizeof(asPWORD)},
+    void_ptr{"void*", "ptr", sizeof(void*)}, f32{"float", "float", 4}, f64{"double", "double", 8};
 } // namespace var_types
 
 template<typename T> inline std::string imm_int(T v, VarType type) { return fmt::format("({}){}", type.c, v); }
@@ -213,6 +214,10 @@ struct StackPush : InsRef {
 		using namespace var_types;
 		using namespace operands;
 
+		// asPWORD is a distinct type from asDWORD/asQWORD on 32-bit targets, so use the integer of the same width
+		using PwordInt       = std::conditional_t<sizeof(asPWORD) == sizeof(asQWORD), asQWORD, asDWORD>;
+		using PwordImmediate = Immediate<PwordInt>;
+
 		angelsea_assert(is_specific_ins<StackPush>(ins));
 
 		switch (ins.opcode()) {
@@ -225,8 +230,8 @@ struct StackPush : InsRef {
 		case asBC_PshG4:   value = GlobalVariable{std::bit_cast<void*>(ins.pword0()), u32, true, true}; break;
 		case asBC_PshC8:   value = Immediate<asQWORD>{ins.qword0()}; break;
 		case asBC_PshV8:   value = FrameVariable{ins.sword0(), u64}; break;
-		case asBC_VAR:     value = Immediate<asPWORD>{asPWORD(ins.sword0())}; break;
-		case asBC_PshNull: value = Immediate<asPWORD>{0}; break;
+		case asBC_VAR:     value = PwordImmediate{PwordInt(ins.sword0())}; break;
+		case asBC_PshNull: value = PwordImmediate{0}; break;
 		case asBC_PshVPtr: value = FrameVariable{ins.sword0(), pword}; break;
 		case asBC_PshGPtr: value = GlobalVariable{std::bit_cast<void*>(ins.pword0()), pword, true, true}; break;
 		case asBC_PshRPtr: value = ValueRegister{pword}; break;

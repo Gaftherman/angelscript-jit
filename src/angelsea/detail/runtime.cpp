@@ -52,14 +52,18 @@ inline int asea_prepare_script_stack_common(
 	// update stack size if needed
 	asUINT old_length = callstack.GetLength();
 	if (old_length >= callstack.GetCapacity()) [[unlikely]] {
-		if (engine.ep.maxCallStackSize > 0 && old_length >= engine.ep.maxCallStackSize * CALLSTACK_FRAME_SIZE) {
+		if (ASEA_MAX_CALLSTACK_SIZE(engine) > 0 && old_length >= ASEA_MAX_CALLSTACK_SIZE(engine) * CALLSTACK_FRAME_SIZE) {
 			// the call stack is too big to grow further
 			ctx.SetInternalException(TXT_STACK_OVERFLOW);
 			return 1;
 		}
 		callstack.AllocateNoConstruct(old_length + (10 * CALLSTACK_FRAME_SIZE), true);
 	}
+#if ANGELSCRIPT_VERSION >= 23700
 	callstack.SetLengthNoAllocate(old_length + CALLSTACK_FRAME_SIZE);
+#else
+	callstack.SetLengthNoConstruct(old_length + CALLSTACK_FRAME_SIZE); // capacity was ensured above
+#endif
 
 	asPWORD* target = callstack.AddressOf() + old_length;
 
@@ -170,7 +174,7 @@ void asea_clean_args(asSVMRegisters* vm_registers, asCScriptFunction& fn, asDWOR
 void asea_cast(asSVMRegisters* vm_registers, asCScriptObject* obj, asDWORD type_id) {
 	asCScriptEngine& engine = asea_get_engine(vm_registers);
 
-	asCObjectType& type = *obj->objType;
+	asCObjectType& type = *asea_script_object_peek::type_of(obj);
 	asCObjectType& to   = *engine.GetObjectTypeFromTypeId(type_id);
 
 	if (type.Implements(&to) || type.DerivesFrom(&to)) {
@@ -185,7 +189,7 @@ asCScriptFunction* asea_resolve_virtual_function(asCScriptObject* obj, asCScript
 		return nullptr;
 	}
 
-	asCObjectType* type = obj->objType;
+	asCObjectType* type = asea_script_object_peek::type_of(obj);
 	if (fn->funcType != asFUNC_INTERFACE) {
 		return type->virtualFunctionTable[fn->vfTableIdx];
 	}
@@ -209,4 +213,32 @@ void* asea_new_script_object(asCObjectType* obj_type) {
 void* asea_alloc(asQWORD size) { return userAlloc(size); }
 
 void asea_free(void* ptr) { userFree(ptr); }
+
+int asea_powi(int base, int exponent, int* overflow) {
+	bool flag = false;
+	const int r = as_powi(base, exponent, flag);
+	*overflow = flag ? 1 : 0;
+	return r;
+}
+
+asDWORD asea_powu(asDWORD base, asDWORD exponent, int* overflow) {
+	bool flag = false;
+	const asDWORD r = as_powu(base, exponent, flag);
+	*overflow = flag ? 1 : 0;
+	return r;
+}
+
+asINT64 asea_powi64(asINT64 base, asINT64 exponent, int* overflow) {
+	bool flag = false;
+	const asINT64 r = as_powi64(base, exponent, flag);
+	*overflow = flag ? 1 : 0;
+	return r;
+}
+
+asQWORD asea_powu64(asQWORD base, asQWORD exponent, int* overflow) {
+	bool flag = false;
+	const asQWORD r = as_powu64(base, exponent, flag);
+	*overflow = flag ? 1 : 0;
+	return r;
+}
 }

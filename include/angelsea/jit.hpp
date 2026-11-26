@@ -4,6 +4,7 @@
 
 #include <angelscript.h>
 #include <angelsea/config.hpp>
+#include <angelsea/detail/compat.hpp>
 #include <angelsea/fnconfig.hpp>
 #include <functional>
 #include <memory>
@@ -14,7 +15,11 @@ namespace detail {
 class MirJit;
 }
 
+#if ASEA_JIT_INTERFACE_V2
 class Jit final : public asIJITCompilerV2 {
+#else
+class Jit final : public asIJITCompiler {
+#endif
 	public:
 	Jit(const JitConfig& config, asIScriptEngine& engine);
 
@@ -24,10 +29,18 @@ class Jit final : public asIJITCompilerV2 {
 	Jit(Jit&&)            = default;
 	Jit& operator=(Jit&&) = default;
 
-	~Jit() override;
+	~Jit();
 
+#if ASEA_JIT_INTERFACE_V2
 	void NewFunction(asIScriptFunction* scriptFunc) override;
 	void CleanFunction(asIScriptFunction* scriptFunc, asJITFunction jitFunc) override;
+#else
+	/// Interface version 1 (releases before 2.37): the engine calls this when a function is finished. The function is
+	/// registered like NewFunction does and compiled lazily. Records of functions discarded with their module stay until
+	/// the engine is destroyed, because version 1 does not tell which function a released JIT function belonged to.
+	int  CompileFunction(asIScriptFunction* scriptFunc, asJITFunction* output) override;
+	void ReleaseJITFunction(asJITFunction func) override;
+#endif
 
 	using CompileFunc = void(void* ud);
 
@@ -56,6 +69,17 @@ class Jit final : public asIJITCompilerV2 {
 	/// See \ref SetFnConfigRequestCallback. For all pending functions, this will cause the provided function config
 	/// callback to be called, and never again after.
 	void DiscoverFnConfig();
+
+	/// Ahead-of-time input: writes the C source of every function of \p module to `<path>.c` and the symbols it
+	/// expects the loader to provide (`name<TAB>kind<TAB>key`) to `<path>.externs`. Compile the C with a gcc or clang
+	/// that accepts GNU extensions. Returns false when nothing was written.
+	bool ExportModuleC(asIScriptModule& module, const char* path);
+
+	/// Ahead-of-time loader: installs the functions of a library built from the C written by \ref ExportModuleC.
+	/// \p library is the shared library (`.dll`, `.so`, `.dylib`) and \p manifest the `<path>.externs` file. Call it after
+	/// the module is built, before running it. Functions whose bytecode changed since the export are skipped, a library
+	/// made for another AngelScript release is rejected. Returns how many functions were installed.
+	std::size_t LoadAot(asIScriptModule& module, const char* library, const char* manifest);
 
 	private:
 	std::unique_ptr<detail::MirJit> m_compiler;

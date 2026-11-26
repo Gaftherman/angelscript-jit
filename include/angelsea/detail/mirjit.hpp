@@ -13,6 +13,11 @@
 #include <unordered_map>
 #include <utility>
 
+#ifndef ASEA_NO_MIR
+#define ASEA_NO_MIR 0
+#endif
+
+#if !ASEA_NO_MIR
 extern "C" {
 #include <c2mir/c2mir.h>
 #include <mir-alloc.h>
@@ -20,9 +25,11 @@ extern "C" {
 #include <mir-gen.h>
 #include <mir.h>
 }
+#endif
 
 namespace angelsea::detail {
 
+#if !ASEA_NO_MIR
 class Mir {
 	public:
 	explicit Mir(MIR_context_t ctx) : m_ctx{ctx} {}
@@ -56,6 +63,8 @@ class C2Mir {
 	MIR_context_t m_ctx;
 };
 
+#endif // !ASEA_NO_MIR
+
 class MirJit;
 
 struct LazyMirFunction {
@@ -76,7 +85,9 @@ struct AsyncMirFunction {
 	struct {
 		std::atomic<bool> ready;
 		asJITFunction     jit_function;
+#if !ASEA_NO_MIR
 		MIR_module_t      module;
+#endif
 	} compiled;
 };
 
@@ -96,6 +107,16 @@ class MirJit {
 	void unregister_function(asIScriptFunction& script_function);
 
 	void bind_engine_globals(asIScriptEngine& engine);
+
+	/// Translates every script function and method of \p module to one C translation unit (AOT input). Returns the C
+	/// source and a manifest with one line per extern symbol: `c_name<TAB>kind<TAB>key`. Returns false when the module
+	/// has no function that could be translated.
+	/// Installs the functions of an AOT library built from \ref export_module_c: resolves every extern symbol it needs
+	/// against \p module and the engine, checks each function against its bytecode hash and hands the engine the compiled
+	/// entry points. Returns the number of functions installed (0 on any failure; nothing is installed then).
+	[[nodiscard]] std::size_t load_aot(asIScriptModule& module, const char* library_path, const char* manifest_path);
+
+	[[nodiscard]] bool export_module_c(asIScriptModule& module, std::string& c_source, std::string& manifest);
 
 	/// Triggers C translation of a lazily-compiled function. Returns `true` if the translation was actually triggered
 	/// (as it can be skipped in certain circumstances), `false` if compilation was permanently cancelled or temporarily
@@ -124,7 +145,9 @@ class MirJit {
 	JitConfig        m_config;
 	asIScriptEngine* m_engine;
 
+#if !ASEA_NO_MIR
 	Mir        m_mir;
+#endif
 	std::mutex m_mir_lock;
 
 	BytecodeToC m_c_generator;

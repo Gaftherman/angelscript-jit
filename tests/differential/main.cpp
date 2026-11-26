@@ -89,13 +89,18 @@ Result run_once(const std::string& path, const Options& options, bool with_jit) 
 	engine->SetEngineProperty(asEP_BUILD_WITHOUT_LINE_CUES, true);
 
 	angelsea::JitConfig config{};
-	config.triggers.eager                 = true;
+	config.triggers.eager                 = std::getenv("ASEA_HITS") == nullptr;
+	if (const char* hits = std::getenv("ASEA_HITS")) config.triggers.hits_before_func_compile = std::strtoull(hits, nullptr, 10);
 	config.experimental_stack_elision     = std::getenv("ASEA_NO_ELISION") == nullptr;
 	config.log_targets.performance_hint   = asMSGTYPE_INFORMATION;
 	config.log_targets.verbose            = asEMsgType(-1);
 	config.c.human_readable               = std::getenv("ASEA_HUMAN") != nullptr;
 	config.hack_ignore_exceptions         = std::getenv("ASEA_STRICT_EXC") == nullptr;
 	config.experimental_direct_continue   = std::getenv("ASEA_NO_CONTINUE") == nullptr;
+	config.experimental_register_locals   = std::getenv("ASEA_NO_REGLOCALS") == nullptr;
+	if (const char* lvl = std::getenv("ASEA_MIR_LEVEL")) config.mir_optimization_level = std::atoi(lvl);
+	if (const char* lvl = std::getenv("ASEA_MIR_DEBUG")) config.debug.mir_debug_level = std::atoi(lvl);
+	config.debug.dump_mir_code = std::getenv("ASEA_DUMP_MIR") != nullptr;
 	config.debug.dump_c_code              = std::getenv("ASEA_DUMP_C") != nullptr;
 	config.debug.blacklist_instructions   = options.blacklist;
 	config.debug.fallback_after_instruction = options.fallback_after;
@@ -104,7 +109,9 @@ Result run_once(const std::string& path, const Options& options, bool with_jit) 
 	angelsea::Jit* jit = nullptr;
 	if (with_jit) {
 		engine->SetEngineProperty(asEP_INCLUDE_JIT_INSTRUCTIONS, true);
+#if ANGELSCRIPT_VERSION >= 23700
 		engine->SetEngineProperty(asEP_JIT_INTERFACE_VERSION, 2);
+#endif
 		jit = new angelsea::Jit(config, *engine);
 		engine->SetJITCompiler(jit);
 	}
@@ -118,6 +125,21 @@ Result run_once(const std::string& path, const Options& options, bool with_jit) 
 			result.error = "build failed";
 		} else {
 			asIScriptModule*                module = engine->GetModule("m");
+			if (jit != nullptr) {
+				// ASEA_AOT=<base>: load <base>.dll/.so and <base>.externs built from a previous ASEA_EXPORT_C=<base> run
+				if (const char* aot = std::getenv("ASEA_AOT")) {
+#if defined(_WIN32)
+					const std::string library = std::string{aot} + ".dll";
+#else
+					const std::string library = std::string{aot} + ".so";
+#endif
+					const std::size_t loaded = jit->LoadAot(*module, library.c_str(), (std::string{aot} + ".externs").c_str());
+					std::fprintf(stderr, "LoadAot: %zu functions\n", loaded);
+				}
+				if (const char* export_path = std::getenv("ASEA_EXPORT_C")) {
+					std::fprintf(stderr, "ExportModuleC: %s\n", jit->ExportModuleC(*module, export_path) ? "ok" : "failed");
+				}
+			}
 			std::vector<asIScriptFunction*> entries;
 			if (options.all) {
 				// Scripts of the Catch2 suite hold several test functions instead of one `main`: run every global
@@ -183,7 +205,30 @@ std::vector<asEBCInstr> parse_list(std::string_view text) {
 }
 } // namespace
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+// ASEA_CRASH_INFO=1: print where an access violation happened (module and offset), to map it with a symbolizer
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* info) {
+	const void* address = info->ExceptionRecord->ExceptionAddress;
+	HMODULE     module  = nullptr;
+	char        name[260] = "?";
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(address), &module)) {
+		GetModuleFileNameA(module, name, sizeof(name));
+	}
+	std::fprintf(stderr, "CRASH code=%lx at %p module=%s offset=%llx\n", info->ExceptionRecord->ExceptionCode, address, name,
+	             static_cast<unsigned long long>(static_cast<const char*>(address) - reinterpret_cast<const char*>(module)));
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+	if (std::getenv("ASEA_CRASH_INFO") != nullptr) {
+		SetUnhandledExceptionFilter(crash_filter);
+	}
+#endif
 	Options                  options;
 	std::vector<std::string> scripts;
 	for (int i = 1; i < argc; ++i) {
@@ -242,6 +287,9 @@ int main(int argc, char** argv) {
 			++mismatches;
 			std::cout << "  vm : state=" << vm.state << " error=[" << vm.error << "] out=" << vm.out.size() << " bytes\n"
 			          << "  jit: state=" << jit.state << " error=[" << jit.error << "] out=" << jit.out.size() << " bytes\n";
+			if (std::getenv("ASEA_SHOW_OUT") != nullptr) {
+				std::cout << "  vm out:  " << vm.out << "\n  jit out: " << jit.out << "\n";
+			}
 		}
 	}
 	std::cout << (mismatches == 0 ? "all scripts match" : "mismatches: " + std::to_string(mismatches)) << '\n';

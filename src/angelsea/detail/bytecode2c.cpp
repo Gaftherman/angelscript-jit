@@ -81,10 +81,10 @@ void BytecodeToC::translate_function(std::string_view internal_module_name, asIS
 		// (compiler-generated functions), which reads out of bounds.
 		const auto& script_fn = static_cast<const asCScriptFunction&>(fn);
 		if (script_fn.scriptData != nullptr && script_fn.scriptData->scriptSectionIdx >= 0) {
-			fn.GetDeclaredAt(&section_name, &row, &col);
+			get_declared_at(fn, &section_name, &row, &col);
 		}
 #else
-		fn.GetDeclaredAt(&section_name, &row, &col);
+		get_declared_at(fn, &section_name, &row, &col);
 #endif
 		emit(
 		    "/* {}:{}:{}: {} */\n",
@@ -142,6 +142,10 @@ void BytecodeToC::translate_function(std::string_view internal_module_name, asIS
 		discover_function_call_pushes(state);
 	}
 	discover_peephole(state);
+	discover_register_locals(state);
+
+	m_active_fn_state = &state;
+	emit_register_local_declarations(state);
 
 	if (m_config->experimental_direct_generic_call /* && state.has_direct_generic_call*/) {
 		// FIXME: has_direct_generic_call is broken with refcpyv
@@ -159,7 +163,7 @@ void BytecodeToC::translate_function(std::string_view internal_module_name, asIS
 	if (m_config->debug.trace_functions) {
 		const char* section;
 		int         row, col;
-		fn.GetDeclaredAt(&section, &row, &col);
+		get_declared_at(fn, &section, &row, &col);
 		emit(
 		    "\tasea_debug_message(_regs, \"TRACE FUNCTION: module "
 		    "{}: {}:{}:{}: {}; JitEntry follows:\");\n"
@@ -172,6 +176,7 @@ void BytecodeToC::translate_function(std::string_view internal_module_name, asIS
 		);
 	}
 
+	emit_reload_all(state);
 	emit_entry_dispatch(state);
 
 	for (InsRef ins : get_bytecode(fn)) {
@@ -180,6 +185,7 @@ void BytecodeToC::translate_function(std::string_view internal_module_name, asIS
 	}
 
 	emit_error_handlers(state);
+	m_active_fn_state = nullptr;
 
 	emit("}}\n");
 }
@@ -248,18 +254,10 @@ void BytecodeToC::configure_jit_entries(FnState& state) {
 		case asBC_CallPtr:
 		case asBC_ChkRefS:
 		case asBC_ClrHi:
-		case asBC_FuncPtr:
 		case asBC_AllocMem:
 		case asBC_SetListSize:
 		case asBC_PshListElmnt:
-		case asBC_SetListType:
-		case asBC_POWi:
-		case asBC_POWu:
-		case asBC_POWf:
-		case asBC_POWd:
-		case asBC_POWdi:
-		case asBC_POWi64:
-		case asBC_POWu64:       is_trace_supported = false; break;
+		case asBC_SetListType:  is_trace_supported = false; break;
 
 		// only skip if it's a known instruction as of writing
 		default:                is_trace_supported = ins.opcode() <= asBC_Thiscall1;
@@ -378,6 +376,529 @@ void BytecodeToC::discover_peephole(FnState& state) {
 	}
 }
 
+void BytecodeToC::discover_register_locals(FnState& state) {
+	using namespace var_types;
+	if (!m_config->experimental_register_locals) {
+		return;
+	}
+
+	// Indirect calls (interface, bound and function pointer) leave compiled code and re-enter through a JitEntry, which
+	// would reload every promoted local each time; measured slower than leaving the variables in the frame.
+	for (InsRef ins : get_bytecode(*state.fn)) {
+		const auto op = ins.opcode();
+		if (op == asBC_CALLINTF || op == asBC_CALLBND || op == asBC_CallPtr) {
+			return;
+		}
+	}
+
+	enum class SizeClass : std::uint8_t {
+		NONE,
+		BYTES_4,
+		BYTES_8,
+	};
+
+	struct OffsetScanInfo {
+		SizeClass size_class      = SizeClass::NONE;
+		bool      disqualified    = false;
+		bool      is_written      = false;
+		bool      has_f32         = false;
+		bool      has_f64         = false;
+		bool      has_u32         = false;
+		bool      has_u64         = false;
+		bool      has_pword       = false;
+		bool      has_non_f32_int = false;
+		bool      has_s64         = false;
+	};
+
+	std::unordered_map<int, OffsetScanInfo> scan;
+	std::unordered_set<int>                 blocked_slots;
+
+	const auto size_class_for = [](VarType type) -> SizeClass {
+		if (type == pword || type == void_ptr) {
+			return AS_PTR_SIZE == 2 ? SizeClass::BYTES_8 : SizeClass::BYTES_4;
+		}
+		if (type == u64 || type == s64 || type == f64) {
+			return SizeClass::BYTES_8;
+		}
+		if (type == u32 || type == s32 || type == f32 || type == u8 || type == s8 || type == u16 || type == s16) {
+			return SizeClass::BYTES_4;
+		}
+		return SizeClass::NONE;
+	};
+
+	// An 8-byte slot at offset N occupies fp - N and fp - (N - 1).
+	const auto disqualify = [&](int offset, int dwords = 1) {
+		scan[offset].disqualified = true;
+		for (int i = 0; i < dwords; ++i) {
+			blocked_slots.insert(offset - i);
+		}
+	};
+
+	const auto record_access = [&](int offset, VarType type, bool is_write, bool is_inc_dec = false) {
+		const SizeClass sc   = size_class_for(type);
+		auto&           info = scan[offset];
+		if (sc == SizeClass::NONE) {
+			info.disqualified = true;
+			return;
+		}
+		if (info.size_class == SizeClass::NONE) {
+			info.size_class = sc;
+		} else if (info.size_class != sc) {
+			info.disqualified = true;
+		}
+		if (is_write) {
+			info.is_written = true;
+		}
+		if (type == f32) {
+			info.has_f32 = true;
+		} else if (type == f64) {
+			info.has_f64 = true;
+		} else if (type == pword || type == void_ptr) {
+			info.has_pword = true;
+		} else if (type == u32) {
+			info.has_u32 = true;
+			if (is_inc_dec) {
+				info.has_non_f32_int = true;
+			}
+		} else if (type == u64) {
+			info.has_u64 = true;
+		} else if (type == s64) {
+			info.has_s64 = true;
+		} else {
+			info.has_non_f32_int = true;
+		}
+	};
+
+	// Disqualify the hidden return-on-stack pointer slot and any object/onHeap variables
+	// that AngelScript cleans up on exception unwinding or touches via frame pointers.
+	const auto& script_fn = static_cast<const asCScriptFunction&>(*state.fn);
+	if (script_fn.DoesReturnOnStack()) {
+		const int ret_offset = script_fn.objectType != nullptr ? -AS_PTR_SIZE : 0;
+		disqualify(ret_offset, AS_PTR_SIZE);
+	}
+	if (script_fn.scriptData != nullptr) {
+		for (asUINT i = 0; i < script_fn.scriptData->variables.GetLength(); ++i) {
+			const asSScriptVariable* var = script_fn.scriptData->variables[i];
+			if (var == nullptr) {
+				continue;
+			}
+			if (ASEA_VAR_ON_HEAP(var) || ((var->type.IsObject() || var->type.IsFuncdef()) && !var->type.IsReference())) {
+				int dwords = 1;
+				if (ASEA_VAR_ON_HEAP(var)) {
+					dwords = AS_PTR_SIZE;
+				} else if (var->type.IsObject()) {
+					dwords = (std::max)(1, var->type.GetSizeInMemoryDWords());
+				} else {
+					dwords = (std::max)(1, var->type.GetSizeOnStackDWords());
+				}
+				disqualify(var->stackOffset, dwords);
+			}
+		}
+	}
+
+	for (InsRef ins : get_bytecode(*state.fn)) {
+		switch (ins.opcode()) {
+		case asBC_PshV4:     record_access(ins.sword0(), u32, false); break;
+		case asBC_PshV8:     record_access(ins.sword0(), u64, false); break;
+		case asBC_PshVPtr:   record_access(ins.sword0(), pword, false); break;
+		case asBC_PSF:       disqualify(ins.sword0()); break;
+		case asBC_VAR:       disqualify(ins.sword0()); break; // Pushes offset for GETOBJ/GETOBJREF/GETREF
+		case asBC_ChkNullV:  record_access(ins.sword0(), pword, false); break;
+		case asBC_FREE:      disqualify(ins.sword0(), AS_PTR_SIZE); break;
+		case asBC_SetV1:
+		case asBC_SetV2:
+		case asBC_SetV4:     record_access(ins.sword0(), u32, true); break;
+		case asBC_SetV8:     record_access(ins.sword0(), u64, true); break;
+		case asBC_ClrVPtr:   record_access(ins.sword0(), pword, true); break;
+		case asBC_CpyVtoR4:  record_access(ins.sword0(), u32, false); break;
+		case asBC_CpyRtoV4:  record_access(ins.sword0(), u32, true); break;
+		case asBC_CpyVtoR8:  record_access(ins.sword0(), u64, false); break;
+		case asBC_CpyRtoV8:  record_access(ins.sword0(), u64, true); break;
+		case asBC_CpyVtoV4:
+			record_access(ins.sword0(), u32, true);
+			record_access(ins.sword1(), u32, false);
+			break;
+		case asBC_CpyVtoV8:
+			record_access(ins.sword0(), u64, true);
+			record_access(ins.sword1(), u64, false);
+			break;
+		case asBC_CpyVtoG4:  record_access(ins.sword0(), u32, false); break;
+		case asBC_CpyGtoV4:  record_access(ins.sword0(), u32, true); break;
+		case asBC_LDV:       disqualify(ins.sword0()); break;
+		case asBC_RefCpyV:   disqualify(ins.sword0(), AS_PTR_SIZE); break;
+		case asBC_LOADOBJ:
+		case asBC_STOREOBJ:  disqualify(ins.sword0(), AS_PTR_SIZE); break;
+		case asBC_LoadRObjR: record_access(ins.sword0(), pword, false); break;
+		case asBC_LoadVObjR: disqualify(ins.sword0()); break;
+		case asBC_LoadThisR: record_access(0, pword, false); break;
+		case asBC_WRTV1:     record_access(ins.sword0(), u8, false); break;
+		case asBC_WRTV2:     record_access(ins.sword0(), u16, false); break;
+		case asBC_WRTV4:     record_access(ins.sword0(), u32, false); break;
+		case asBC_WRTV8:     record_access(ins.sword0(), u64, false); break;
+		case asBC_RDR1:
+		case asBC_RDR2:      disqualify(ins.sword0()); break;
+		case asBC_RDR4:      record_access(ins.sword0(), u32, true); break;
+		case asBC_RDR8:      record_access(ins.sword0(), u64, true); break;
+		case asBC_JMPP:      record_access(ins.sword0(), s32, false); break;
+		case asBC_NOT:       disqualify(ins.sword0()); break;
+		case asBC_IncVi:
+		case asBC_DecVi:     record_access(ins.sword0(), u32, true, true); break;
+		case asBC_CMPi:
+		case asBC_CMPu:
+		case asBC_CMPd:
+		case asBC_CMPf:
+		case asBC_CMPi64:
+		case asBC_CMPu64:
+		case asBC_CmpPtr:
+		case asBC_CMPIi:
+		case asBC_CMPIu:
+		case asBC_CMPIf: {
+			bcins::Compare cmp{ins};
+			record_access(cmp.lhs.idx, cmp.lhs.type, false);
+			if (const auto* rhs = std::get_if<operands::FrameVariable>(&cmp.rhs)) {
+				record_access(rhs->idx, rhs->type, false);
+			}
+			break;
+		}
+		case asBC_NEGi:   record_access(ins.sword0(), s32, true); break;
+		case asBC_NEGi64: record_access(ins.sword0(), s64, true); break;
+		case asBC_NEGf:   record_access(ins.sword0(), f32, true); break;
+		case asBC_NEGd:   record_access(ins.sword0(), f64, true); break;
+		case asBC_BNOT64: record_access(ins.sword0(), u64, true); break;
+		case asBC_BNOT:   record_access(ins.sword0(), u32, true); break;
+		case asBC_ADDi:
+		case asBC_SUBi:
+		case asBC_MULi:
+		case asBC_DIVi:
+		case asBC_MODi:
+		case asBC_BSRA:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword1(), s32, false);
+			record_access(ins.sword2(), s32, false);
+			break;
+		case asBC_ADDi64:
+		case asBC_SUBi64:
+		case asBC_MULi64:
+		case asBC_DIVi64:
+		case asBC_MODi64:
+			record_access(ins.sword0(), s64, true);
+			record_access(ins.sword1(), s64, false);
+			record_access(ins.sword2(), s64, false);
+			break;
+		case asBC_ADDf:
+		case asBC_SUBf:
+		case asBC_MULf:
+		case asBC_DIVf:
+		case asBC_MODf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword1(), f32, false);
+			record_access(ins.sword2(), f32, false);
+			break;
+		case asBC_ADDd:
+		case asBC_SUBd:
+		case asBC_MULd:
+		case asBC_DIVd:
+		case asBC_MODd:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword1(), f64, false);
+			record_access(ins.sword2(), f64, false);
+			break;
+		case asBC_DIVu:
+		case asBC_MODu:
+		case asBC_BAND:
+		case asBC_BXOR:
+		case asBC_BOR:
+		case asBC_BSLL:
+		case asBC_BSRL:
+			record_access(ins.sword0(), u32, true);
+			record_access(ins.sword1(), u32, false);
+			record_access(ins.sword2(), u32, false);
+			break;
+		case asBC_DIVu64:
+		case asBC_MODu64:
+		case asBC_BAND64:
+		case asBC_BXOR64:
+		case asBC_BOR64:
+			record_access(ins.sword0(), u64, true);
+			record_access(ins.sword1(), u64, false);
+			record_access(ins.sword2(), u64, false);
+			break;
+		case asBC_BSLL64:
+		case asBC_BSRL64:
+			record_access(ins.sword0(), u64, true);
+			record_access(ins.sword1(), u64, false);
+			record_access(ins.sword2(), u32, false);
+			break;
+		case asBC_BSRA64:
+			record_access(ins.sword0(), s64, true);
+			record_access(ins.sword1(), s64, false);
+			record_access(ins.sword2(), u32, false);
+			break;
+		case asBC_ADDIi:
+		case asBC_SUBIi:
+		case asBC_MULIi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword1(), s32, false);
+			break;
+		case asBC_ADDIf:
+		case asBC_SUBIf:
+		case asBC_MULIf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword1(), f32, false);
+			break;
+		case asBC_iTOb:
+		case asBC_iTOw:     disqualify(ins.sword0()); break;
+		case asBC_iTOf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword0(), s32, false);
+			break;
+		case asBC_fTOi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword0(), f32, false);
+			break;
+		case asBC_uTOf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword0(), u32, false);
+			break;
+		case asBC_fTOu:
+			record_access(ins.sword0(), u32, true);
+			record_access(ins.sword0(), f32, false);
+			break;
+		case asBC_sbTOi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword0(), s8, false);
+			break;
+		case asBC_swTOi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword0(), s16, false);
+			break;
+		case asBC_ubTOi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword0(), u8, false);
+			break;
+		case asBC_uwTOi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword0(), u16, false);
+			break;
+		case asBC_i64TOi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword1(), s64, false);
+			break;
+		case asBC_uTOi64:
+			record_access(ins.sword0(), s64, true);
+			record_access(ins.sword1(), u32, false);
+			break;
+		case asBC_iTOi64:
+			record_access(ins.sword0(), s64, true);
+			record_access(ins.sword1(), s32, false);
+			break;
+		case asBC_fTOd:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword1(), f32, false);
+			break;
+		case asBC_dTOf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword1(), f64, false);
+			break;
+		case asBC_fTOi64:
+			record_access(ins.sword0(), s64, true);
+			record_access(ins.sword1(), f32, false);
+			break;
+		case asBC_dTOi64:
+			record_access(ins.sword0(), s64, true);
+			record_access(ins.sword0(), f64, false);
+			break;
+		case asBC_fTOu64:
+			record_access(ins.sword0(), u64, true);
+			record_access(ins.sword1(), f32, false);
+			break;
+		case asBC_dTOu64:
+			record_access(ins.sword0(), u64, true);
+			record_access(ins.sword0(), f64, false);
+			break;
+		case asBC_i64TOf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword1(), s64, false);
+			break;
+		case asBC_u64TOf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword1(), u64, false);
+			break;
+		case asBC_i64TOd:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword0(), s64, false);
+			break;
+		case asBC_u64TOd:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword0(), u64, false);
+			break;
+		case asBC_dTOi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword1(), f64, false);
+			break;
+		case asBC_dTOu:
+			record_access(ins.sword0(), u32, true);
+			record_access(ins.sword1(), f64, false);
+			break;
+		case asBC_iTOd:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword1(), s32, false);
+			break;
+		case asBC_uTOd:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword1(), u32, false);
+			break;
+		// Unsupported instructions that may read/write frame variables when falling back to the VM:
+		case asBC_LdGRdR4:
+		case asBC_AllocMem:
+		case asBC_SetListSize:
+		case asBC_PshListElmnt:
+		case asBC_SetListType: disqualify(ins.sword0()); break;
+		case asBC_CallPtr:     disqualify(ins.sword1(), AS_PTR_SIZE); break;
+		case asBC_POWi:
+			record_access(ins.sword0(), s32, true);
+			record_access(ins.sword1(), s32, false);
+			record_access(ins.sword2(), s32, false);
+			break;
+		case asBC_POWu:
+			record_access(ins.sword0(), u32, true);
+			record_access(ins.sword1(), u32, false);
+			record_access(ins.sword2(), u32, false);
+			break;
+		case asBC_POWf:
+			record_access(ins.sword0(), f32, true);
+			record_access(ins.sword1(), f32, false);
+			record_access(ins.sword2(), f32, false);
+			break;
+		case asBC_POWd:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword1(), f64, false);
+			record_access(ins.sword2(), f64, false);
+			break;
+		case asBC_POWdi:
+			record_access(ins.sword0(), f64, true);
+			record_access(ins.sword1(), f64, false);
+			record_access(ins.sword2(), s32, false);
+			break;
+		case asBC_POWi64:
+			record_access(ins.sword0(), s64, true);
+			record_access(ins.sword1(), s64, false);
+			record_access(ins.sword2(), s64, false);
+			break;
+		case asBC_POWu64:
+			record_access(ins.sword0(), u64, true);
+			record_access(ins.sword1(), u64, false);
+			record_access(ins.sword2(), u64, false);
+			break;
+		default: break;
+		}
+	}
+
+	std::unordered_map<int, int> slot_claim_count;
+	for (const auto& [offset, info] : scan) {
+		if (info.disqualified || info.size_class == SizeClass::NONE) {
+			blocked_slots.insert(offset);
+			if (info.size_class == SizeClass::BYTES_8) {
+				blocked_slots.insert(offset - 1);
+			}
+			continue;
+		}
+		++slot_claim_count[offset];
+		if (info.size_class == SizeClass::BYTES_8) {
+			++slot_claim_count[offset - 1];
+		}
+	}
+
+	for (const auto& [offset, info] : scan) {
+		if (info.disqualified || info.size_class == SizeClass::NONE) {
+			continue;
+		}
+		if (blocked_slots.contains(offset) || slot_claim_count[offset] != 1) {
+			continue;
+		}
+		if (info.size_class == SizeClass::BYTES_8
+		    && (blocked_slots.contains(offset - 1) || slot_claim_count[offset - 1] != 1)) {
+			continue;
+		}
+
+		PromotedLocalKind kind;
+		if (info.size_class == SizeClass::BYTES_4) {
+			if (info.has_f32 && !info.has_non_f32_int && !info.has_pword) {
+				kind = PromotedLocalKind::F32;
+			} else if (info.has_pword && !info.has_f32 && !info.has_u32 && !info.has_non_f32_int) {
+				kind = PromotedLocalKind::PWORD;
+			} else {
+				kind = PromotedLocalKind::U32;
+			}
+		} else {
+			if (info.has_f64 && !info.has_s64 && !info.has_pword) {
+				kind = PromotedLocalKind::F64;
+			} else if (info.has_pword && !info.has_f64 && !info.has_u64 && !info.has_s64) {
+				kind = PromotedLocalKind::PWORD;
+			} else {
+				kind = PromotedLocalKind::U64;
+			}
+		}
+
+		state.promoted_locals.emplace(offset, PromotedLocal{.offset = offset, .kind = kind, .is_written = info.is_written});
+	}
+}
+
+void BytecodeToC::emit_register_local_declarations(const FnState& state) {
+	for (const auto& [offset, local] : state.promoted_locals) {
+		std::string_view type_name;
+		switch (local.kind) {
+		case PromotedLocalKind::U32:   type_name = "asDWORD"; break;
+		case PromotedLocalKind::F32:   type_name = "float"; break;
+		case PromotedLocalKind::U64:   type_name = "asQWORD"; break;
+		case PromotedLocalKind::F64:   type_name = "double"; break;
+		case PromotedLocalKind::PWORD: type_name = "asPWORD"; break;
+		}
+		emit("\t{} {};\n", type_name, promoted_local_name(offset));
+	}
+}
+
+void BytecodeToC::emit_spill_lines_to(std::string& target, const FnState& state, std::string_view indent) {
+	using namespace var_types;
+	for (const auto& [offset, local] : state.promoted_locals) {
+		if (!local.is_written) {
+			continue;
+		}
+		VarType mem_type = u32;
+		switch (local.kind) {
+		case PromotedLocalKind::U32:   mem_type = u32; break;
+		case PromotedLocalKind::F32:   mem_type = f32; break;
+		case PromotedLocalKind::U64:   mem_type = u64; break;
+		case PromotedLocalKind::F64:   mem_type = f64; break;
+		case PromotedLocalKind::PWORD: mem_type = pword; break;
+		}
+		emit_to(target, "{}{} = {};\n", indent, frame_var_mem(offset, mem_type), promoted_local_name(offset));
+	}
+}
+
+void BytecodeToC::emit_spill_all(const FnState& state) {
+	emit_spill_lines_to(m_module_state.code_blocks.function_code, state, "\t\t");
+}
+
+void BytecodeToC::emit_reload_lines_to(std::string& target, const FnState& state, std::string_view indent) {
+	using namespace var_types;
+	for (const auto& [offset, local] : state.promoted_locals) {
+		VarType mem_type = u32;
+		switch (local.kind) {
+		case PromotedLocalKind::U32:   mem_type = u32; break;
+		case PromotedLocalKind::F32:   mem_type = f32; break;
+		case PromotedLocalKind::U64:   mem_type = u64; break;
+		case PromotedLocalKind::F64:   mem_type = f64; break;
+		case PromotedLocalKind::PWORD: mem_type = pword; break;
+		}
+		emit_to(target, "{}{} = {};\n", indent, promoted_local_name(offset), frame_var_mem(offset, mem_type));
+	}
+}
+
+void BytecodeToC::emit_reload_all(const FnState& state) {
+	emit_reload_lines_to(m_module_state.code_blocks.function_code, state, "\t\t");
+}
+
 void BytecodeToC::emit_entry_dispatch(FnState& state) {
 	if (!state.has_any_late_jit_entries) {
 		if (m_config->c.human_readable) {
@@ -415,42 +936,67 @@ void BytecodeToC::emit_error_handlers(FnState& state) {
 	const auto requires_handler = [&](ErrorHandler handler) {
 		return (std::uint64_t(state.error_handlers_mask) & std::uint64_t(handler)) != 0;
 	};
+	const bool        has_promoted = !state.promoted_locals.empty();
+	const char* const vm_target    = has_promoted ? "vm_after_spill" : "vm";
 
 	if (requires_handler(ErrorHandler::ERR_NULL)) {
+		emit("\terr_null:\n");
+		emit_spill_all(state);
 		emit(
-		    "\terr_null:\n"
 		    "\t\tasea_set_internal_exception(_regs, \"" TXT_NULL_POINTER_ACCESS
 		    "\");\n"
-		    "\t\tgoto vm;\n"
-		    "\t\n"
+		    "\t\tgoto {VM_TARGET};\n"
+		    "\t\n",
+		    fmt::arg("VM_TARGET", vm_target)
 		);
 		state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
 	}
 
 	if (requires_handler(ErrorHandler::ERR_DIVIDE_BY_ZERO)) {
+		emit("\terr_divide_by_zero:\n");
+		emit_spill_all(state);
 		emit(
-		    "\terr_divide_by_zero:\n"
 		    "\t\tasea_set_internal_exception(_regs, \"" TXT_DIVIDE_BY_ZERO
 		    "\");\n"
-		    "\t\tgoto vm;\n"
-		    "\t\n"
+		    "\t\tgoto {VM_TARGET};\n"
+		    "\t\n",
+		    fmt::arg("VM_TARGET", vm_target)
 		);
 		state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
 	}
 
 	if (requires_handler(ErrorHandler::ERR_DIVIDE_OVERFLOW)) {
+		emit("\terr_divide_overflow:\n");
+		emit_spill_all(state);
 		emit(
-		    "\terr_divide_overflow:\n"
 		    "\t\tasea_set_internal_exception(_regs, \"" TXT_DIVIDE_OVERFLOW
 		    "\");\n"
-		    "\t\tgoto vm;\n"
-		    "\t\n"
+		    "\t\tgoto {VM_TARGET};\n"
+		    "\t\n",
+		    fmt::arg("VM_TARGET", vm_target)
+		);
+		state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
+	}
+
+	if (requires_handler(ErrorHandler::ERR_POW_OVERFLOW)) {
+		emit("\terr_pow_overflow:\n");
+		emit_spill_all(state);
+		emit(
+		    "\t\tasea_set_internal_exception(_regs, \"" TXT_POW_OVERFLOW
+		    "\");\n"
+		    "\t\tgoto {VM_TARGET};\n"
+		    "\t\n",
+		    fmt::arg("VM_TARGET", vm_target)
 		);
 		state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
 	}
 
 	if (requires_handler(ErrorHandler::VM_FALLBACK)) {
 		emit("\tvm:\n");
+		emit_spill_all(state);
+		if (has_promoted) {
+			emit("\tvm_after_spill:\n");
+		}
 		emit_save_sp(state);
 		emit("\treturn;\n");
 	}
@@ -703,26 +1249,57 @@ void BytecodeToC::translate_instruction(FnState& state) {
 	// V1/V2 are equivalent to V4
 	case asBC_SetV1:
 	case asBC_SetV2:
-	case asBC_SetV4:    emit_assign_ins(state, frame_var(ins.sword0(), u32), imm_int(ins.dword0(), u32)); break;
-	case asBC_SetV8:    emit_assign_ins(state, frame_var(ins.sword0(), u64), imm_int(ins.qword0(), u64)); break;
+	case asBC_SetV4:    emit_write_frame_var(state, ins.sword0(), u32, imm_int(ins.dword0(), u32)); break;
+	case asBC_SetV8:    emit_write_frame_var(state, ins.sword0(), u64, imm_int(ins.qword0(), u64)); break;
 
-	case asBC_ClrVPtr:  emit_assign_ins(state, frame_var(ins.sword0(), pword), "0"); break;
+	case asBC_ClrVPtr:  emit_write_frame_var(state, ins.sword0(), pword, "0"); break;
 
-	case asBC_CpyVtoR4: emit_assign_ins(state, "value_reg", frame_var(ins.sword0(), u32)); break;
-	case asBC_CpyRtoV4: emit_assign_ins(state, frame_var(ins.sword0(), u32), "value_reg"); break;
-	case asBC_CpyVtoR8: emit_assign_ins(state, "value_reg", frame_var(ins.sword0(), u64)); break;
-	case asBC_CpyRtoV8: emit_assign_ins(state, frame_var(ins.sword0(), u64), "value_reg"); break;
-	case asBC_CpyVtoV4: emit_assign_ins(state, frame_var(ins.sword0(), u32), frame_var(ins.sword1(), u32)); break;
-	case asBC_CpyVtoV8: emit_assign_ins(state, frame_var(ins.sword0(), u64), frame_var(ins.sword1(), u64)); break;
+	case asBC_CpyVtoR4: {
+		const auto val = read_frame_var(state, ins.sword0(), u32, "cpy_val");
+		emit_assign_ins(state, "value_reg", val);
+		break;
+	}
+	case asBC_CpyRtoV4: emit_write_frame_var(state, ins.sword0(), u32, "value_reg"); break;
+	case asBC_CpyVtoR8: {
+		const auto val = read_frame_var(state, ins.sword0(), u64, "cpy_val");
+		emit_assign_ins(state, "value_reg", val);
+		break;
+	}
+	case asBC_CpyRtoV8: emit_write_frame_var(state, ins.sword0(), u64, "value_reg"); break;
+	case asBC_CpyVtoV4: {
+		const auto* dst_p = find_promoted_local(ins.sword0());
+		const auto* src_p = find_promoted_local(ins.sword1());
+		if (dst_p != nullptr && src_p != nullptr && dst_p->kind == PromotedLocalKind::F32
+		    && src_p->kind == PromotedLocalKind::F32) {
+			emit_assign_ins(state, promoted_local_name(ins.sword0()), promoted_local_name(ins.sword1()));
+		} else {
+			const auto src = read_frame_var(state, ins.sword1(), u32, "cpy_src");
+			emit_write_frame_var(state, ins.sword0(), u32, src);
+		}
+		break;
+	}
+	case asBC_CpyVtoV8: {
+		const auto* dst_p = find_promoted_local(ins.sword0());
+		const auto* src_p = find_promoted_local(ins.sword1());
+		if (dst_p != nullptr && src_p != nullptr && dst_p->kind == PromotedLocalKind::F64
+		    && src_p->kind == PromotedLocalKind::F64) {
+			emit_assign_ins(state, promoted_local_name(ins.sword0()), promoted_local_name(ins.sword1()));
+		} else {
+			const auto src = read_frame_var(state, ins.sword1(), u64, "cpy_src");
+			emit_write_frame_var(state, ins.sword0(), u64, src);
+		}
+		break;
+	}
 
 	case asBC_CpyVtoG4: {
 		std::string symbol = emit_global_lookup(state, std::bit_cast<void*>(ins.pword0()), true);
-		emit_assign_ins(state, fmt::format("*(asDWORD*)&{}", symbol), frame_var(ins.sword0(), u32));
+		const auto  val    = read_frame_var(state, ins.sword0(), u32, "cpy_val");
+		emit_assign_ins(state, fmt::format("*(asDWORD*)&{}", symbol), val);
 		break;
 	}
 	case asBC_CpyGtoV4: {
 		std::string symbol = emit_global_lookup(state, std::bit_cast<void*>(ins.pword0()), true);
-		emit_assign_ins(state, frame_var(ins.sword0(), u32), fmt::format("*(asDWORD*)&{}", symbol));
+		emit_write_frame_var(state, ins.sword0(), u32, fmt::format("*(asDWORD*)&{}", symbol));
 		break;
 	}
 
@@ -904,8 +1481,26 @@ void BytecodeToC::translate_instruction(FnState& state) {
 	// FIXME: strict aliasing
 	case asBC_WRTV1: emit_assign_ins(state, "((asea_var*)value_reg)->as_asBYTE", frame_var(ins.sword0(), u8)); break;
 	case asBC_WRTV2: emit_assign_ins(state, "((asea_var*)value_reg)->as_asWORD", frame_var(ins.sword0(), u16)); break;
-	case asBC_WRTV4: emit_assign_ins(state, "((asea_var*)value_reg)->as_asDWORD", frame_var(ins.sword0(), u32)); break;
-	case asBC_WRTV8: emit_assign_ins(state, "((asea_var*)value_reg)->as_asQWORD", frame_var(ins.sword0(), u64)); break;
+	case asBC_WRTV4: {
+		if (const auto* promoted = find_promoted_local(ins.sword0());
+		    promoted != nullptr && promoted->kind == PromotedLocalKind::F32) {
+			emit_assign_ins(state, "((asea_var*)value_reg)->as_float", promoted_local_name(ins.sword0()));
+		} else {
+			const auto val = read_frame_var(state, ins.sword0(), u32, "wrt_val");
+			emit_assign_ins(state, "((asea_var*)value_reg)->as_asDWORD", val);
+		}
+		break;
+	}
+	case asBC_WRTV8: {
+		if (const auto* promoted = find_promoted_local(ins.sword0());
+		    promoted != nullptr && promoted->kind == PromotedLocalKind::F64) {
+			emit_assign_ins(state, "((asea_var*)value_reg)->as_double", promoted_local_name(ins.sword0()));
+		} else {
+			const auto val = read_frame_var(state, ins.sword0(), u64, "wrt_val");
+			emit_assign_ins(state, "((asea_var*)value_reg)->as_asQWORD", val);
+		}
+		break;
+	}
 
 	case asBC_RDR1:  {
 		emit(
@@ -923,10 +1518,27 @@ void BytecodeToC::translate_instruction(FnState& state) {
 		);
 		break;
 	}
-	case asBC_RDR4: emit_assign_ins(state, frame_var(ins.sword0(), u32), "((asea_var*)value_reg)->as_asDWORD"); break;
-	case asBC_RDR8: emit_assign_ins(state, frame_var(ins.sword0(), u64), "((asea_var*)value_reg)->as_asQWORD"); break;
+	case asBC_RDR4: {
+		if (const auto* promoted = find_promoted_local(ins.sword0());
+		    promoted != nullptr && promoted->kind == PromotedLocalKind::F32) {
+			emit_assign_ins(state, promoted_local_name(ins.sword0()), "((asea_var*)value_reg)->as_float");
+		} else {
+			emit_write_frame_var(state, ins.sword0(), u32, "((asea_var*)value_reg)->as_asDWORD");
+		}
+		break;
+	}
+	case asBC_RDR8: {
+		if (const auto* promoted = find_promoted_local(ins.sword0());
+		    promoted != nullptr && promoted->kind == PromotedLocalKind::F64) {
+			emit_assign_ins(state, promoted_local_name(ins.sword0()), "((asea_var*)value_reg)->as_double");
+		} else {
+			emit_write_frame_var(state, ins.sword0(), u64, "((asea_var*)value_reg)->as_asQWORD");
+		}
+		break;
+	}
 
 	case asBC_Cast: {
+		emit_spill_all(state);
 		emit(
 		    "\t\tasCScriptObject** h = (asCScriptObject**)sp->as_ptr;\n"
 		    "\t\tif (h && *h) {{ asea_cast(_regs, *h, {TYPEID}); }}\n"
@@ -977,6 +1589,24 @@ void BytecodeToC::translate_instruction(FnState& state) {
 			state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
 		}
 		emit_direct_script_call_ins(state, ScriptCallByExpr{.fn_decl = virtual_fn, .expr = "v_fn"});
+		break;
+	}
+
+	case asBC_CallPtr: {
+		// A call through a function pointer variable. A null pointer, a delegate or an application function is left to
+		// the VM, which executes this same instruction again (raising the unbound function exception, binding the
+		// delegate's object or calling the system function); a script function is called like a virtual one.
+		emit(
+		    "\t\tasCScriptFunction* v_fn = *(asCScriptFunction**){PTR};\n"
+		    "\t\tif (v_fn == 0 || *(int*)((char*)v_fn + {OFF_FUNCTYPE}) != {FUNC_SCRIPT}) {{ regs->pc = base_pc + {INS_OFFSET}; goto vm; }}\n",
+		    // before 2.37 the instruction is one dword with the variable in the first argument
+		    fmt::arg("PTR", frame_ptr(ins.size() == 1 ? ins.sword0() : ins.sword1())),
+		    fmt::arg("OFF_FUNCTYPE", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptfn_functype)),
+		    fmt::arg("FUNC_SCRIPT", int(asFUNC_SCRIPT)),
+		    fmt::arg("INS_OFFSET", ins.offset)
+		);
+		state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
+		emit_direct_script_call_ins(state, ScriptCallByExpr{.fn_decl = nullptr, .expr = "v_fn"});
 		break;
 	}
 
@@ -1218,28 +1848,43 @@ void BytecodeToC::translate_instruction(FnState& state) {
 		emit_binop_var_imm_ins(state, "*", f32, "rhs_i2f.f", f32);
 		break;
 
-	case asBC_SwapPtr:      // TODO: find way to emit
-	case asBC_LdGRdR4:      // TODO: find way to emit
+	case asBC_FuncPtr: {
+		// the function is an extern symbol so that no run-specific address ends up in the generated code (AOT)
+		auto* const       target_fn = std::bit_cast<asCScriptFunction*>(ins.pword0());
+		const std::string symbol    = fmt::format("{}_scriptfn{}", m_c_symbol_prefix, target_fn->id);
+		if (m_on_map_extern_callback) {
+			m_on_map_extern_callback(symbol.c_str(), ExternScriptFunction{target_fn->id}, target_fn);
+		}
+		emit_forward_declaration(state, symbol, "extern char {}[];\n", symbol);
+		emit(
+		    "\t\tsp = (asea_var*)((char*)sp - sizeof(asPWORD));\n"
+		    "\t\tsp->as_asPWORD = (asPWORD)&{};\n",
+		    symbol
+		);
+		break;
+	}
+
+	case asBC_SwapPtr:      // rare and never produced by the test corpus, so not emitted without a test
+	case asBC_LdGRdR4:
+	case asBC_ChkRefS:
+	case asBC_ClrHi:
 	case asBC_CALLBND:      // TODO: find way to emit & implement (calls & syscalls)
-	case asBC_CallPtr:      // TODO: find way to emit & implement (calls & syscalls) -- probably just functors
-	case asBC_ChkRefS:      // TODO: find way to emit
-	case asBC_ClrHi:        // TODO: find way to emit
-	case asBC_FuncPtr:      // TODO: find way to emit
 	case asBC_AllocMem:     // TODO: implement (seems used in list factories)
 	case asBC_SetListSize:  // TODO: implement
 	case asBC_PshListElmnt: // TODO: implement
 	case asBC_SetListType:  // TODO: find way to emit
-	case asBC_POWi:         // TODO: write tests and implement
-	case asBC_POWu:         // TODO: write tests and implement
-	case asBC_POWf:         // TODO: write tests and implement
-	case asBC_POWd:         // TODO: write tests and implement
-	case asBC_POWdi:        // TODO: write tests and implement
-	case asBC_POWi64:       // TODO: write tests and implement
-	case asBC_POWu64:       // TODO: write tests and implement
 	{
 		emit_vm_fallback(state, "unsupported instruction");
 		break;
 	}
+
+	case asBC_POWi:   emit_pow_var_ins(state, s32, s32, s32, "asea_powi"); break;
+	case asBC_POWu:   emit_pow_var_ins(state, u32, u32, u32, "asea_powu"); break;
+	case asBC_POWf:   emit_pow_var_ins(state, f32, f32, f32, "powf"); break;
+	case asBC_POWd:   emit_pow_var_ins(state, f64, f64, f64, "pow"); break;
+	case asBC_POWdi:  emit_pow_var_ins(state, f64, s32, f64, "pow"); break;
+	case asBC_POWi64: emit_pow_var_ins(state, s64, s64, s64, "asea_powi64"); break;
+	case asBC_POWu64: emit_pow_var_ins(state, u64, u64, u64, "asea_powu64"); break;
 
 	default: {
 		emit_vm_fallback(state, "unknown instruction");
@@ -1273,6 +1918,7 @@ std::string BytecodeToC::jump_to_error_handler_code(FnState& state, ErrorHandler
 	case ErrorHandler::ERR_NULL:            handler_name = "err_null"; break;
 	case ErrorHandler::ERR_DIVIDE_BY_ZERO:  handler_name = "err_divide_by_zero"; break;
 	case ErrorHandler::ERR_DIVIDE_OVERFLOW: handler_name = "err_divide_overflow"; break;
+	case ErrorHandler::ERR_POW_OVERFLOW:    handler_name = "err_pow_overflow"; break;
 	}
 
 	return fmt::format(
@@ -1297,8 +1943,10 @@ void BytecodeToC::emit_save_pc(FnState& state, bool next_pc) {
 void BytecodeToC::emit_primitive_cast_var_ins(FnState& state, VarType src, VarType dst) {
 	InsRef&    ins      = state.ins;
 	const bool in_place = ins.size() == 1;
+	const int  src_off  = in_place ? ins.sword0() : ins.sword1();
 
 	if (src.size != dst.size && dst.size < 4) {
+		const auto src_expr = read_frame_var(state, src_off, src, "cast_src");
 		emit(
 		    "\t\t{DST_TYPE} value = {SRC};\n"
 		    "\t\tasea_var *dst = {DSTPTR};\n"
@@ -1306,11 +1954,12 @@ void BytecodeToC::emit_primitive_cast_var_ins(FnState& state, VarType src, VarTy
 		    "\t\tdst->as_{DST_TYPE} = value;\n",
 		    fmt::arg("DST_TYPE", dst.c),
 		    fmt::arg("DSTPTR", frame_ptr(ins.sword0())),
-		    fmt::arg("SRC", frame_var(in_place ? ins.sword0() : ins.sword1(), src))
+		    fmt::arg("SRC", src_expr)
 		);
 		return;
 	}
-	emit_assign_ins(state, frame_var(ins.sword0(), dst), frame_var(in_place ? ins.sword0() : ins.sword1(), src));
+	const auto src_expr = read_frame_var(state, src_off, src, "cast_src");
+	emit_write_frame_var(state, ins.sword0(), dst, src_expr);
 }
 
 std::string
@@ -1428,6 +2077,26 @@ std::string BytecodeToC::emit_dummy_struct_declaration(FnState& state, const asC
 	return gen_name;
 }
 
+/// Frame offsets (positive, `fp - offset`) of the object and funcdef variables that hold a pointer to a heap object: the VM
+/// zeroes them when the function starts. Releases before 2.36 list them in objVariablePos (the first objVariablesOnHeap
+/// entries; value types on the stack come after and must not be cleared, and temporaries are only listed there).
+static std::vector<int> heap_object_offsets(const asCScriptFunction& fn) {
+	std::vector<int> offsets;
+#if ANGELSCRIPT_VERSION >= 23600
+	for (asUINT n = fn.scriptData->variables.GetLength(); n-- > 0;) {
+		const asSScriptVariable& var = *fn.scriptData->variables[n];
+		if (var.stackOffset > 0 && var.onHeap && (var.type.IsObject() || var.type.IsFuncdef())) {
+			offsets.push_back(var.stackOffset);
+		}
+	}
+#else
+	for (asUINT i = fn.scriptData->objVariablesOnHeap; i-- > 0;) {
+		offsets.push_back(fn.scriptData->objVariablePos[i]);
+	}
+#endif
+	return offsets;
+}
+
 void BytecodeToC::emit_direct_script_call_ins(FnState& state, std::variant<ScriptCallByIdx, ScriptCallByExpr> call) {
 	// TODO: figure out a way to inline callees. maybe we can find simple functions and trigger their generation in
 	// a way that ensures they will be compiled? or we can just bring them into our module??
@@ -1457,34 +2126,58 @@ void BytecodeToC::emit_direct_script_call_ins(FnState& state, std::variant<Scrip
 
 	if (will_emit_direct) {
 		if (known_fn != nullptr) {
+			// the callee's bytecode address is an extern symbol, like every other pointer of the run
+			const std::string callee_bc = fmt::format("{}_bcfn{}", m_c_symbol_prefix, known_fn->id);
+			if (m_on_map_extern_callback) {
+				m_on_map_extern_callback(
+				    callee_bc.c_str(), ExternBytecodeDefinition{.fn = known_fn}, known_fn->scriptData->byteCode.AddressOf()
+				);
+			}
+			emit_forward_declaration(state, callee_bc, "extern asDWORD {}[];\n", callee_bc);
+			// Fast path of asea_prepare_script_stack for a callee known at compile time: room in the call stack and in
+			// the current stack block. Anything else (growth, a new block, stack overflow) takes the runtime helper.
 			emit(
-			    "\t\tasea_prepare_script_stack(_regs, {FN}, base_pc + {INS_OFFSET}, sp, fp);\n",
+			    "\t\t{{\n"
+			    "\t\t\tasea_array* cs = (asea_array*)((char*)regs->ctx + {OFF_CALLSTACK});\n"
+			    "\t\t\tasUINT stack_index = *(asUINT*)((char*)regs->ctx + {OFF_STACKINDEX});\n"
+			    "\t\t\tasDWORD* block_low = ((asDWORD**)((asea_array*)((char*)regs->ctx + {OFF_STACKBLOCKS}))->ptr)[stack_index];\n"
+			    "\t\t\tif (cs->len < cs->max_len && (asDWORD*)sp - {NEEDED} >= block_low) {{\n"
+			    "\t\t\t\tasPWORD* target = (asPWORD*)cs->ptr + cs->len;\n"
+			    "\t\t\t\tcs->len += {FRAMESIZE};\n"
+			    "\t\t\t\ttarget[0] = (asPWORD)fp;\n"
+			    "\t\t\t\ttarget[1] = (asPWORD)*(void**)((char*)regs->ctx + {OFF_CURRENTFN});\n"
+			    "\t\t\t\ttarget[2] = (asPWORD)(base_pc + {INS_OFFSET});\n"
+			    "\t\t\t\ttarget[3] = (asPWORD)sp;\n"
+			    "\t\t\t\ttarget[4] = (asPWORD)stack_index;\n"
+			    "\t\t\t\t*(void**)((char*)regs->ctx + {OFF_CURRENTFN}) = (void*){FN};\n"
+			    "\t\t\t\tregs->sp = (asDWORD*)sp - {VARSPACE};\n"
+			    "\t\t\t\tregs->pc = (asDWORD*){BYTECODE_PTR};\n"
+			    "\t\t\t\tregs->fp = sp;\n"
+			    "\t\t\t}} else {{\n"
+			    "\t\t\t\tasea_prepare_script_stack(_regs, {FN}, base_pc + {INS_OFFSET}, sp, fp);\n"
+			    "\t\t\t}}\n"
+			    "\t\t}}\n",
 			    fmt::arg("FN", fn_expr),
-			    fmt::arg("BYTECODE", m_module_state.fn_bytecode_ptr),
-			    fmt::arg("INS_OFFSET", state.ins.offset + state.ins.size())
+			    fmt::arg("INS_OFFSET", state.ins.offset + state.ins.size()),
+			    fmt::arg("OFF_CALLSTACK", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_callstack)),
+			    fmt::arg("OFF_STACKINDEX", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_stackindex)),
+			    fmt::arg("OFF_STACKBLOCKS", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_stackblocks)),
+			    fmt::arg("OFF_CURRENTFN", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_currentfn)),
+			    fmt::arg("FRAMESIZE", CALLSTACK_FRAME_SIZE),
+			    fmt::arg("NEEDED", known_fn->scriptData->stackNeeded + RESERVE_STACK),
+			    fmt::arg("VARSPACE", known_fn->scriptData->variableSpace),
+			    fmt::arg("BYTECODE_PTR", callee_bc)
 			);
-			bool emitted_fp_var = false;
-			// setup stack with our knowledge
-			for (asUINT n = known_fn->scriptData->variables.GetLength(); n-- > 0;) {
-				asSScriptVariable* var = known_fn->scriptData->variables[n];
-
-				// don't clear the function arguments
-				if (var->stackOffset <= 0) {
-					continue;
+			// setup stack with our knowledge: the heap object variables start out null
+			const std::vector<int> clear_offsets = heap_object_offsets(*known_fn);
+			if (!clear_offsets.empty()) {
+				emit("\t\tasDWORD* callee_fp = regs->fp;\n");
+			}
+			for (const int offset : clear_offsets) {
+				if (m_config->c.human_readable) {
+					emit("\t\t/* variable requires clearing @ stack pos {} */\n", -offset);
 				}
-
-				if (var->onHeap && (var->type.IsObject() || var->type.IsFuncdef())) {
-					if (!emitted_fp_var) {
-						emit("\t\tasDWORD* callee_fp = regs->fp;\n");
-						emitted_fp_var = true;
-					}
-
-					if (m_config->c.human_readable) {
-						emit("\t\t/* arg {} requires clearing @ stack pos {} */\n", n, -var->stackOffset);
-					}
-
-					emit("\t\t((asea_var*)(callee_fp + {}))->as_asPWORD = 0;\n", -var->stackOffset);
-				}
+				emit("\t\t((asea_var*)(callee_fp + {}))->as_asPWORD = 0;\n", -offset);
 			}
 		} else {
 			// if the function is not known, do the above stack logic dynamically in runtime
@@ -1502,19 +2195,23 @@ void BytecodeToC::emit_direct_script_call_ins(FnState& state, std::variant<Scrip
 		// fell back to the VM leaves its own frame behind, so the check fails and we return as before. Beyond a
 		// number of nested script frames the VM drives the call, so deep recursion cannot exhaust the native stack.
 		const std::size_t next_offset = state.ins.offset + state.ins.size();
-		const std::string continue_code
-		    = m_config->experimental_direct_continue && state.branch_targets.contains(next_offset)
-		    ? fmt::format(
-		          "\t\t\tif (regs->pc == base_pc + {NEXT} && (void*)regs->fp == (void*)fp\n"
-		          "\t\t\t    && *(int*)((char*)regs->ctx + {OFF_STATUS}) == asEXECUTION_ACTIVE) {{\n"
-		          "\t\t\t\tsp = regs->sp;\n"
-		          "\t\t\t\tvalue_reg = regs->value;\n"
-		          "\t\t\t\tgoto bc{NEXT};\n"
-		          "\t\t\t}}\n",
-		          fmt::arg("NEXT", next_offset),
-		          fmt::arg("OFF_STATUS", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_status))
-		      )
-		    : std::string{};
+		std::string       continue_code;
+		if (m_config->experimental_direct_continue && state.branch_targets.contains(next_offset)) {
+			continue_code = fmt::format(
+			    "\t\t\tif (regs->pc == base_pc + {NEXT} && (void*)regs->fp == (void*)fp\n"
+			    "\t\t\t    && *(int*)((char*)regs->ctx + {OFF_STATUS}) == asEXECUTION_ACTIVE) {{\n"
+			    "\t\t\t\tsp = regs->sp;\n"
+			    "\t\t\t\tvalue_reg = regs->value;\n"
+			    "\t\t\t\tgoto bc{NEXT};\n"
+			    "\t\t\t}}\n",
+			    fmt::arg("NEXT", next_offset),
+			    fmt::arg("OFF_STATUS", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_status))
+			);
+		}
+		// Promoted locals live in registers while the callee runs: only the paths that hand this frame back to the VM
+		// (a callee that fell back, or one that raised or suspended) need them in memory.
+		std::string spill_lines;
+		emit_spill_lines_to(spill_lines, state, "\t\t");
 		const auto callstack_guard = fmt::format(
 		    "((asea_array*)((char*)regs->ctx + {OFF_CALLSTACK}))->len < {LIMIT}",
 		    fmt::arg("OFF_CALLSTACK", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_callstack)),
@@ -1530,10 +2227,12 @@ void BytecodeToC::emit_direct_script_call_ins(FnState& state, std::variant<Scrip
 			    "\t\t\t{SELF}(_regs, 1);\n"
 			    "{CONTINUE}"
 			    "\t\t}}\n"
+			    "{SPILL}"
 			    "\t\treturn;\n",
 			    fmt::arg("GUARD", callstack_guard),
 			    fmt::arg("SELF", m_module_state.fn_name),
-			    fmt::arg("CONTINUE", continue_code)
+			    fmt::arg("CONTINUE", continue_code),
+			    fmt::arg("SPILL", spill_lines)
 			);
 		} else {
 			// look up JITFunction to branch into directly. if it doesn't exist that's fine; in both case we drop to
@@ -1545,17 +2244,20 @@ void BytecodeToC::emit_direct_script_call_ins(FnState& state, std::variant<Scrip
 			    "\t\t\tjit_fn(_regs, 1);\n"
 			    "{CONTINUE}"
 			    "\t\t}}\n"
+			    "{SPILL}"
 			    "\t\treturn;\n",
 			    fmt::arg("FN", fn_expr),
 			    fmt::arg("OFF_SCRIPTFN_SCRIPTDATA", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptfn_scriptdata)),
 			    fmt::arg("OFF_SCRIPTDATA_JITFN", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptdata_jitfunction)),
 			    fmt::arg("GUARD", callstack_guard),
-			    fmt::arg("CONTINUE", continue_code)
+			    fmt::arg("CONTINUE", continue_code),
+			    fmt::arg("SPILL", spill_lines)
 			);
 		}
 	} else {
 		// Call fallback: We initiate the call from JIT, and the rest of the JitEntry handler will branch into the
 		// correct instruction.
+		emit_spill_all(state);
 		emit_save_sp(state);
 		emit_save_pc(state, true);
 		emit(
@@ -1572,6 +2274,14 @@ void BytecodeToC::emit_system_call(FnState& state, SystemCall call) {
 		    "\t\t/* Attempt direct system call for `{}` */\n",
 		    m_script_engine->scriptFunctions[call.fn_idx]->GetDeclaration(true, true, true)
 		);
+	}
+
+	const bool outer_system_call = !state.in_system_call;
+	if (outer_system_call) {
+		state.in_system_call = true;
+		if (m_config->experimental_spill_on_native_calls) {
+			emit_spill_all(state);
+		}
 	}
 
 	const auto emit_for_abi = [&](AbiMask abi) {
@@ -1624,10 +2334,13 @@ void BytecodeToC::emit_system_call(FnState& state, SystemCall call) {
 	// TODO: move this logic in its own function
 	emit("#if defined(__linux__) && (defined(__GNUC__) || defined(__MIRC__)) && defined(__x86_64__)\n");
 	emit_for_abi(AbiMask::LINUX_GCC_X86_64);
-	emit("#elif defined(_WIN32) && (defined(_MSC_VER) || defined(ASEA_ABI_MSVC))\n"); // must precede mingw check
+	emit("#elif defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64) || defined(ASEA_ABI_MSVC)) "
+	     "&& (defined(_MSC_VER) || defined(ASEA_ABI_MSVC))\n"); // must precede mingw check
 	emit_for_abi(AbiMask::WINDOWS_MSVC_X86_64);
 	emit("#elif defined(_WIN32) && (defined(__GNUC__) || defined(__MIRC__)) && defined(__x86_64__)\n");
 	emit_for_abi(AbiMask::WINDOWS_MINGW_X86_64);
+	emit("#elif defined(_WIN32) && defined(_MSC_VER) && defined(_M_IX86)\n");
+	emit_for_abi(AbiMask::WINDOWS_MSVC_X86);
 	emit("#elif defined(__APPLE__) && defined(__x86_64__)\n");
 	emit_for_abi(AbiMask::MACOS_X86_64);
 	emit("#elif defined(__linux__) && (defined(__GNUC__) || defined(__MIRC__)) && defined(__aarch64__)\n");
@@ -1637,6 +2350,10 @@ void BytecodeToC::emit_system_call(FnState& state, SystemCall call) {
 	emit("#else\n");
 	emit_for_abi(AbiMask::GENERIC);
 	emit("#endif\n");
+
+	if (outer_system_call) {
+		state.in_system_call = false;
+	}
 }
 
 void BytecodeToC::emit_enter_system_call(std::string_view fn_desc_symbol) {
@@ -1655,15 +2372,17 @@ void BytecodeToC::emit_leave_system_call(FnState& state) {
 	// instruction when the context is no longer active; code running here has to do the same, or it goes on with
 	// whatever the callee returned (a null reference after an out of bounds access).
 	state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
+	const char* const vm_target = state.promoted_locals.empty() ? "vm" : "vm_after_spill";
 	emit(
 	    "\t\t*(void**)((char*)regs->ctx + {OFF_CALLING}) = 0;\n"
 	    "\t\tif (*(int*)((char*)regs->ctx + {OFF_STATUS}) != asEXECUTION_ACTIVE) {{\n"
 	    "\t\t\tregs->pc = base_pc + {NEXT_OFFSET};\n"
-	    "\t\t\tgoto vm;\n"
+	    "\t\t\tgoto {VM_TARGET};\n"
 	    "\t\t}}\n",
 	    fmt::arg("OFF_CALLING", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_callingsystemfunction)),
 	    fmt::arg("OFF_STATUS", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_status)),
-	    fmt::arg("NEXT_OFFSET", state.ins.offset + state.ins.size())
+	    fmt::arg("NEXT_OFFSET", state.ins.offset + state.ins.size()),
+	    fmt::arg("VM_TARGET", vm_target)
 	);
 }
 
@@ -1734,7 +2453,7 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_native(
 
 	asSSystemFunctionInterface& sys_fn = *fn.sysFuncIntf;
 
-	if (sys_fn.isCompositeIndirect) {
+	if (ASEA_IS_COMPOSITE_INDIRECT(sys_fn)) {
 		return {.ok = false, .fail_reason = "Direct native call failed: Cannot handle compositeIndirect yet"};
 	}
 
@@ -1809,6 +2528,13 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_native(
 	case ICC_THISCALL:         break;
 	default:                   return {.ok = false, .fail_reason = "Unsupported calling convention"};
 	}
+
+#if defined(_WIN32)
+	if (abi == AbiMask::GENERIC && (sys_fn.callConv == ICC_THISCALL || sys_fn.callConv == ICC_VIRTUAL_THISCALL)) {
+		// 32-bit Windows passes `this` in ECX; the generic ABI only knows it as the first stack argument.
+		return {.ok = false, .fail_reason = "Direct native call failed: thiscall needs a platform ABI on this target"};
+	}
+#endif
 
 	// gather arguments to build C signature (and early fail on unsupported types)
 
@@ -1955,6 +2681,11 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_native(
 
 		if (is_thiscall_objfirst) {
 			push_abi_argument(var_types::void_ptr, "obj");
+			if (abi == AbiMask::WINDOWS_MSVC_X86) {
+				// thiscall puts `this` in ECX and every other argument on the stack: __fastcall with a dummy second
+				// argument (EDX) produces the same call
+				push_abi_argument(var_types::void_ptr, "0");
+			}
 		}
 	}
 
@@ -2127,8 +2858,9 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_native(
 		emit_forward_declaration(
 		    state,
 		    std::string(fn_callable_symbol),
-		    "extern {RETTYPE} {FNCALLABLE}({ARGTYPES});\n",
+		    "extern {RETTYPE} {CALLCONV}{FNCALLABLE}({ARGTYPES});\n",
 		    fmt::arg("RETTYPE", return_type.c),
+		    fmt::arg("CALLCONV", abi == AbiMask::WINDOWS_MSVC_X86 && is_thiscall_objfirst ? "__fastcall " : ""),
 		    fmt::arg("FNCALLABLE", fn_callable_symbol),
 		    fmt::arg("ARGTYPES", fmt::join(formatted_arg_types, ","))
 		);
@@ -2280,7 +3012,7 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_generic(
 		}
 #endif
 
-		if (sys_fn.returnAutoHandle && m_script_engine->ep.genericCallMode == 1) {
+		if (sys_fn.returnAutoHandle && ASEA_GENERIC_CALL_MODE(*m_script_engine) == 1) {
 			return {.ok = false, .fail_reason = "Direct generic call failed: Auto handles not supported yet"};
 		}
 	}
@@ -2385,6 +3117,28 @@ BytecodeToC::SystemCallEmitResult BytecodeToC::emit_direct_system_call_generic(
 }
 
 void BytecodeToC::emit_stack_push_ins(FnState& state, const bcins::StackPush& push) {
+	if (!state.stack_push_infos.contains(state.ins.offset)) {
+		if (const auto* fv = std::get_if<operands::FrameVariable>(&push.value)) {
+			if (const auto* promoted = find_promoted_local(fv->idx)) {
+				if (promoted->kind == PromotedLocalKind::F32) {
+					emit(
+					    "\t\tsp = (asea_var*)((char*)sp - 4);\n"
+					    "\t\tsp->as_float = {};\n",
+					    promoted_local_name(fv->idx)
+					);
+					return;
+				}
+				if (promoted->kind == PromotedLocalKind::F64) {
+					emit(
+					    "\t\tsp = (asea_var*)((char*)sp - 8);\n"
+					    "\t\tsp->as_double = {};\n",
+					    promoted_local_name(fv->idx)
+					);
+					return;
+				}
+			}
+		}
+	}
 	const VarType type = make_local_from_operand(state, "v", push.value);
 	if (state.stack_push_infos.contains(state.ins.offset)) {
 		emit("\t\tpush_tmp{ID} = v;\n", fmt::arg("ID", state.ins.offset));
@@ -2465,18 +3219,19 @@ void BytecodeToC::emit_prefixop_valuereg_ins(FnState& state, std::string_view op
 
 void BytecodeToC::emit_unop_var_inplace_ins(FnState& state, std::string_view op, VarType type) {
 	InsRef& ins = state.ins;
-	emit("\t\t{VAR} = {OP} {VAR};\n", fmt::arg("OP", op), fmt::arg("VAR", frame_var(ins.sword0(), type)));
+	if (find_promoted_local(ins.sword0()) == nullptr) {
+		emit("\t\t{VAR} = {OP} {VAR};\n", fmt::arg("OP", op), fmt::arg("VAR", frame_var(ins.sword0(), type)));
+		return;
+	}
+	const std::string val = read_frame_var(state, ins.sword0(), type, "unop_src");
+	emit_write_frame_var(state, ins.sword0(), type, fmt::format("{} {}", op, val));
 }
 
 void BytecodeToC::emit_binop_var_var_ins(FnState& state, std::string_view op, VarType lhs, VarType rhs, VarType dst) {
-	InsRef& ins = state.ins;
-	emit(
-	    "\t\t{DST} = {LHS} {OP} {RHS};\n",
-	    fmt::arg("OP", op),
-	    fmt::arg("DST", frame_var(ins.sword0(), dst)),
-	    fmt::arg("LHS", frame_var(ins.sword1(), lhs)),
-	    fmt::arg("RHS", frame_var(ins.sword2(), rhs))
-	);
+	InsRef&           ins      = state.ins;
+	const std::string lhs_expr = read_frame_var(state, ins.sword1(), lhs, "lhs_bitcast");
+	const std::string rhs_expr = read_frame_var(state, ins.sword2(), rhs, "rhs_bitcast");
+	emit_write_frame_var(state, ins.sword0(), dst, fmt::format("{} {} {}", lhs_expr, op, rhs_expr));
 }
 
 void BytecodeToC::emit_binop_var_imm_ins(
@@ -2486,30 +3241,55 @@ void BytecodeToC::emit_binop_var_imm_ins(
     std::string_view rhs_expr,
     VarType          dst
 ) {
-	InsRef& ins = state.ins;
-	emit(
-	    "\t\t{DST} = {LHS} {OP} {RHS};\n",
-	    fmt::arg("OP", op),
-	    fmt::arg("DST", frame_var(ins.sword0(), dst)),
-	    fmt::arg("LHS", frame_var(ins.sword1(), lhs)),
-	    fmt::arg("RHS", rhs_expr)
-	);
+	InsRef&           ins      = state.ins;
+	const std::string lhs_expr = read_frame_var(state, ins.sword1(), lhs, "lhs_bitcast");
+	emit_write_frame_var(state, ins.sword0(), dst, fmt::format("{} {} {}", lhs_expr, op, rhs_expr));
+}
+
+void BytecodeToC::emit_pow_var_ins(FnState& state, VarType lhs, VarType rhs, VarType dst, std::string_view fn) {
+	using namespace var_types;
+	InsRef&           ins      = state.ins;
+	const std::string lhs_expr = read_frame_var(state, ins.sword1(), lhs, "lhs_bitcast");
+	const std::string rhs_expr = read_frame_var(state, ins.sword2(), rhs, "rhs_bitcast");
+	const std::string handler  = jump_to_error_handler_code(state, ErrorHandler::ERR_POW_OVERFLOW);
+
+	if (dst == f32 || dst == f64) {
+		const char* const max = dst == f32 ? "3.4028234663852886e38f" : "1.7976931348623157e308";
+		emit(
+		    "\t\t{TYPE} pow_result = {FN}({LHS}, {RHS});\n",
+		    fmt::arg("TYPE", dst.c),
+		    fmt::arg("FN", fn),
+		    fmt::arg("LHS", lhs_expr),
+		    fmt::arg("RHS", rhs_expr)
+		);
+		emit_write_frame_var(state, ins.sword0(), dst, "pow_result");
+		emit(
+		    "\t\tif (pow_result > {MAX} || pow_result < -{MAX}) {{ {HANDLER} }}\n",
+		    fmt::arg("MAX", max),
+		    fmt::arg("HANDLER", handler)
+		);
+		return;
+	}
+
+	emit("\t\tint pow_overflow = 0;\n");
+	emit_write_frame_var(state, ins.sword0(), dst, fmt::format("{}({}, {}, &pow_overflow)", fn, lhs_expr, rhs_expr));
+	emit("\t\tif (pow_overflow) {{ {HANDLER} }}\n", fmt::arg("HANDLER", handler));
 }
 
 void BytecodeToC::emit_divmod_var_float_ins(FnState& state, std::string_view op, VarType type) {
-	InsRef& ins = state.ins;
+	InsRef&           ins = state.ins;
+	const std::string lhs = read_frame_var(state, ins.sword1(), type, "lhs_bitcast");
+	const std::string rhs = read_frame_var(state, ins.sword2(), type, "rhs_bitcast");
 	emit(
 	    "\t\t{TYPE} lhs = {LHS};\n"
 	    "\t\t{TYPE} divider = {RHS};\n"
-	    "\t\tif (divider == 0) {{ {ERR_DIVIDE_BY_ZERO_HANDLER} }}\n"
-	    "\t\t{DST} = {OP}(lhs, divider);\n",
+	    "\t\tif (divider == 0) {{ {ERR_DIVIDE_BY_ZERO_HANDLER} }}\n",
 	    fmt::arg("ERR_DIVIDE_BY_ZERO_HANDLER", jump_to_error_handler_code(state, ErrorHandler::ERR_DIVIDE_BY_ZERO)),
 	    fmt::arg("TYPE", type.c),
-	    fmt::arg("DST", frame_var(ins.sword0(), type)),
-	    fmt::arg("LHS", frame_var(ins.sword1(), type)),
-	    fmt::arg("RHS", frame_var(ins.sword2(), type)),
-	    fmt::arg("OP", op)
+	    fmt::arg("LHS", lhs),
+	    fmt::arg("RHS", rhs)
 	);
+	emit_write_frame_var(state, ins.sword0(), type, fmt::format("{}(lhs, divider)", op));
 }
 
 void BytecodeToC::emit_divmod_var_int_ins(
@@ -2518,38 +3298,36 @@ void BytecodeToC::emit_divmod_var_int_ins(
     std::uint64_t    lhs_overflow_value,
     VarType          type
 ) {
-	InsRef& ins = state.ins;
+	InsRef&           ins = state.ins;
+	const std::string lhs = read_frame_var(state, ins.sword1(), type, "lhs_bitcast");
+	const std::string rhs = read_frame_var(state, ins.sword2(), type, "rhs_bitcast");
 	emit(
 	    "\t\t{TYPE} lhs = {LHS};\n"
 	    "\t\t{TYPE} divider = {RHS};\n"
 	    "\t\tif (divider == 0) {{ {ERR_DIVIDE_BY_ZERO_HANDLER}  }}\n"
-	    "\t\tif (divider == -1 && lhs == ({TYPE}){LHS_OVERFLOW}) {{ {ERR_DIVIDE_OVERFLOW_HANDLER} }}\n"
-	    "\t\t{DST} = lhs {OP} divider;\n",
+	    "\t\tif (divider == -1 && lhs == ({TYPE}){LHS_OVERFLOW}) {{ {ERR_DIVIDE_OVERFLOW_HANDLER} }}\n",
 	    fmt::arg("ERR_DIVIDE_BY_ZERO_HANDLER", jump_to_error_handler_code(state, ErrorHandler::ERR_DIVIDE_BY_ZERO)),
 	    fmt::arg("ERR_DIVIDE_OVERFLOW_HANDLER", jump_to_error_handler_code(state, ErrorHandler::ERR_DIVIDE_OVERFLOW)),
 	    fmt::arg("TYPE", type.c),
-	    fmt::arg("DST", frame_var(ins.sword0(), type)),
-	    fmt::arg("LHS", frame_var(ins.sword1(), type)),
-	    fmt::arg("RHS", frame_var(ins.sword2(), type)),
-	    fmt::arg("SWORD2", ins.sword2()),
-	    fmt::arg("OP", op),
+	    fmt::arg("LHS", lhs),
+	    fmt::arg("RHS", rhs),
 	    fmt::arg("LHS_OVERFLOW", lhs_overflow_value)
 	);
+	emit_write_frame_var(state, ins.sword0(), type, fmt::format("lhs {} divider", op));
 }
 
 void BytecodeToC::emit_divmod_var_unsigned_ins(FnState& state, std::string_view op, VarType type) {
-	InsRef& ins = state.ins;
+	InsRef&           ins = state.ins;
+	const std::string rhs = read_frame_var(state, ins.sword2(), type, "rhs_bitcast");
+	const std::string lhs = read_frame_var(state, ins.sword1(), type, "lhs_bitcast");
 	emit(
 	    "\t\t{TYPE} divider = {RHS};\n"
-	    "\t\tif (divider == 0) {{ {ERR_DIVIDE_BY_ZERO_HANDLER}  }}\n"
-	    "\t\t{DST} = {LHS} {OP} divider;\n",
+	    "\t\tif (divider == 0) {{ {ERR_DIVIDE_BY_ZERO_HANDLER}  }}\n",
 	    fmt::arg("ERR_DIVIDE_BY_ZERO_HANDLER", jump_to_error_handler_code(state, ErrorHandler::ERR_DIVIDE_BY_ZERO)),
 	    fmt::arg("TYPE", type.c),
-	    fmt::arg("DST", frame_var(ins.sword0(), type)),
-	    fmt::arg("LHS", frame_var(ins.sword1(), type)),
-	    fmt::arg("RHS", frame_var(ins.sword2(), type)),
-	    fmt::arg("OP", op)
+	    fmt::arg("RHS", rhs)
 	);
+	emit_write_frame_var(state, ins.sword0(), type, fmt::format("{} {} divider", lhs, op));
 }
 
 std::string BytecodeToC::frame_ptr(std::string_view expr) {
@@ -2563,15 +3341,206 @@ std::string BytecodeToC::frame_ptr(int offset) {
 	return frame_ptr(std::to_string(offset));
 }
 
+std::string BytecodeToC::promoted_local_name(int offset) const {
+	return offset < 0 ? fmt::format("asea_v_m{}", -offset) : fmt::format("asea_v_{}", offset);
+}
+
+const BytecodeToC::PromotedLocal* BytecodeToC::find_promoted_local(int offset) const {
+	if (m_active_fn_state == nullptr) {
+		return nullptr;
+	}
+	const auto it = m_active_fn_state->promoted_locals.find(offset);
+	return it != m_active_fn_state->promoted_locals.end() ? &it->second : nullptr;
+}
+
+std::string BytecodeToC::frame_var_mem(int offset, VarType type) {
+	if (offset == 0) {
+		return fmt::format("fp->as_{}", type.c);
+	}
+	return frame_var(std::to_string(offset), type);
+}
+
+std::string BytecodeToC::read_frame_var(FnState& state, int offset, VarType type, std::string_view tmp_name) {
+	using namespace var_types;
+	const auto* promoted = find_promoted_local(offset);
+	if (promoted == nullptr) {
+		return frame_var_mem(offset, type);
+	}
+	const std::string name = promoted_local_name(offset);
+	if (promoted->kind == PromotedLocalKind::U32 && type == f32) {
+		emit("\t\tasea_i2f_inst.i = {};\n\t\tfloat {} = asea_i2f_inst.f;\n", name, tmp_name);
+		return std::string{tmp_name};
+	}
+	if (promoted->kind == PromotedLocalKind::F32 && type != f32) {
+		emit("\t\tasea_i2f_inst.f = {};\n\t\tasDWORD {} = asea_i2f_inst.i;\n", name, tmp_name);
+		if (type == u32) {
+			return std::string{tmp_name};
+		}
+		if (type == s32) {
+			return fmt::format("((asINT32){})", tmp_name);
+		}
+		if (type == u8) {
+			return fmt::format("((asBYTE){})", tmp_name);
+		}
+		if (type == s8) {
+			return fmt::format("((asINT8)(asBYTE){})", tmp_name);
+		}
+		if (type == u16) {
+			return fmt::format("((asWORD){})", tmp_name);
+		}
+		if (type == s16) {
+			return fmt::format("((asINT16)(asWORD){})", tmp_name);
+		}
+		angelsea_assert(false);
+	}
+	if (promoted->kind == PromotedLocalKind::U64 && type == f64) {
+		emit("\t\tasea_i2f64_inst.i = {};\n\t\tdouble {} = asea_i2f64_inst.f;\n", name, tmp_name);
+		return std::string{tmp_name};
+	}
+	if (promoted->kind == PromotedLocalKind::F64 && type != f64) {
+		emit("\t\tasea_i2f64_inst.f = {};\n\t\tasQWORD {} = asea_i2f64_inst.i;\n", name, tmp_name);
+		if (type == u64) {
+			return std::string{tmp_name};
+		}
+		if (type == s64) {
+			return fmt::format("((asINT64){})", tmp_name);
+		}
+		if (type == pword) {
+			return fmt::format("((asPWORD){})", tmp_name);
+		}
+		if (type == void_ptr) {
+			return fmt::format("((void*){})", tmp_name);
+		}
+		angelsea_assert(false);
+	}
+	return frame_var(offset, type);
+}
+
+void BytecodeToC::emit_write_frame_var(FnState& state, int offset, VarType type, std::string_view src_expr) {
+	using namespace var_types;
+	const auto* promoted = find_promoted_local(offset);
+	if (promoted == nullptr) {
+		emit_assign_ins(state, frame_var_mem(offset, type), src_expr);
+		return;
+	}
+	const std::string name = promoted_local_name(offset);
+	switch (promoted->kind) {
+	case PromotedLocalKind::U32:
+		if (type == f32) {
+			emit("\t\tasea_i2f_inst.f = {};\n\t\t{} = asea_i2f_inst.i;\n", src_expr, name);
+		} else if (type == u32) {
+			emit_assign_ins(state, name, src_expr);
+		} else {
+			emit_assign_ins(state, name, fmt::format("(asDWORD)({})", src_expr));
+		}
+		break;
+	case PromotedLocalKind::F32:
+		if (type == f32) {
+			emit_assign_ins(state, name, src_expr);
+		} else {
+			emit("\t\tasea_i2f_inst.i = {};\n\t\t{} = asea_i2f_inst.f;\n", src_expr, name);
+		}
+		break;
+	case PromotedLocalKind::U64:
+		if (type == f64) {
+			emit("\t\tasea_i2f64_inst.f = {};\n\t\t{} = asea_i2f64_inst.i;\n", src_expr, name);
+		} else if (type == u64) {
+			emit_assign_ins(state, name, src_expr);
+		} else {
+			emit_assign_ins(state, name, fmt::format("(asQWORD)({})", src_expr));
+		}
+		break;
+	case PromotedLocalKind::F64:
+		if (type == f64) {
+			emit_assign_ins(state, name, src_expr);
+		} else {
+			emit("\t\tasea_i2f64_inst.i = {};\n\t\t{} = asea_i2f64_inst.f;\n", src_expr, name);
+		}
+		break;
+	case PromotedLocalKind::PWORD:
+		if (type == pword) {
+			emit_assign_ins(state, name, src_expr);
+		} else {
+			emit_assign_ins(state, name, fmt::format("(asPWORD)({})", src_expr));
+		}
+		break;
+	}
+}
+
 std::string BytecodeToC::frame_var(std::string_view expr, VarType type) {
 	return fmt::format("((asea_var*)((asDWORD*)fp - {}))->as_{}", expr, type.c);
 }
 
 std::string BytecodeToC::frame_var(int offset, VarType type) {
-	if (offset == 0) {
-		return fmt::format("fp->as_{}", type.c);
+	using namespace var_types;
+	if (const auto* promoted = find_promoted_local(offset)) {
+		const std::string name = promoted_local_name(offset);
+		switch (promoted->kind) {
+		case PromotedLocalKind::U32:
+			if (type == u32) {
+				return name;
+			}
+			if (type == s32) {
+				return fmt::format("((asINT32){})", name);
+			}
+			if (type == u8) {
+				return fmt::format("((asBYTE){})", name);
+			}
+			if (type == s8) {
+				return fmt::format("((asINT8)(asBYTE){})", name);
+			}
+			if (type == u16) {
+				return fmt::format("((asWORD){})", name);
+			}
+			if (type == s16) {
+				return fmt::format("((asINT16)(asWORD){})", name);
+			}
+			if (type == pword) {
+				return fmt::format("((asPWORD){})", name);
+			}
+			break;
+		case PromotedLocalKind::F32:
+			if (type == f32) {
+				return name;
+			}
+			break;
+		case PromotedLocalKind::U64:
+			if (type == u64) {
+				return name;
+			}
+			if (type == s64) {
+				return fmt::format("((asINT64){})", name);
+			}
+			if (type == pword) {
+				return fmt::format("((asPWORD){})", name);
+			}
+			if (type == void_ptr) {
+				return fmt::format("((void*){})", name);
+			}
+			break;
+		case PromotedLocalKind::F64:
+			if (type == f64) {
+				return name;
+			}
+			break;
+		case PromotedLocalKind::PWORD:
+			if (type == pword) {
+				return name;
+			}
+			if (type == void_ptr) {
+				return fmt::format("((void*){})", name);
+			}
+			if (type == u64) {
+				return fmt::format("((asQWORD){})", name);
+			}
+			if (type == u32 && AS_PTR_SIZE == 1) {
+				return fmt::format("((asDWORD){})", name);
+			}
+			break;
+		}
+		angelsea_assert(false && "Unhandled promoted frame_var type view");
 	}
-	return frame_var(std::to_string(offset), type);
+	return frame_var_mem(offset, type);
 }
 
 std::string BytecodeToC::stack_var(int offset, VarType type) {

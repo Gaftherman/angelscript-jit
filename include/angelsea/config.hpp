@@ -20,6 +20,8 @@ enum class AbiMask {
 	MACOS_X86_64         = 1 << 4,
 	LINUX_GCC_AARCH64    = 1 << 5,
 	MACOS_AARCH64        = 1 << 6,
+	/// 32-bit Windows with MSVC: `thiscall` passes `this` in ECX, reached from C through `__fastcall` and a dummy EDX.
+	WINDOWS_MSVC_X86     = 1 << 7,
 };
 
 struct JitConfig {
@@ -186,6 +188,16 @@ struct JitConfig {
 	/// was found to regress performance in microbenchmarks.
 	bool experimental_fast_script_return = true;
 
+	/// Promotes eligible VM frame variables to function-scoped scalar C locals so MIR can keep them in registers,
+	/// spilling and reloading across calls, runtime fallbacks, and entry points.
+	bool experimental_register_locals = true;
+
+	/// Write the promoted locals back to the frame before every direct call to an application function, so a callee
+	/// that inspects the context (`GetVar`, `GetAddressOfVar`, an exception callback printing variables) sees current
+	/// values. Off by default: the write-backs cost about 10% on loops that call `array::opIndex`. The locals are still
+	/// written back whenever control returns to the interpreter, raises an exception or leaves the function.
+	bool experimental_spill_on_native_calls = false;
+
 	/// Speeds up the generic calling convention if \ref experimental_direct_generic_call is true by assuming that the
 	/// called system functions will always set the return value. If the callee fails to do so when this function is
 	/// set, uninitialized reads can happen script-side, which may result in crashes with pointers.
@@ -217,8 +229,10 @@ struct JitConfig {
 		AbiMask abi = AbiMask::LINUX_GCC_X86_64;
 #elif defined(_WIN32) && defined(__GNUC__) && defined(__x86_64__)
 		AbiMask abi = AbiMask::WINDOWS_MINGW_X86_64;
-#elif defined(_WIN32) && defined(_MSC_VER)
+#elif defined(_WIN32) && defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
 		AbiMask abi = AbiMask::WINDOWS_MSVC_X86_64;
+#elif defined(_WIN32) && defined(_MSC_VER) && defined(_M_IX86)
+		AbiMask abi = AbiMask::WINDOWS_MSVC_X86;
 #elif defined(__APPLE__) && defined(__x86_64__)
 		AbiMask abi = AbiMask::MACOS_X86_64;
 #elif defined(__linux__) && defined(__GNUC__) && defined(__aarch64__)

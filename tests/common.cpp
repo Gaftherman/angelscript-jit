@@ -92,7 +92,9 @@ angelsea::JitConfig get_test_jit_config() {
 
 EngineContext::EngineContext(const angelsea::JitConfig& config) : engine{asCreateScriptEngine()}, jit{config, *engine} {
 	engine->SetEngineProperty(asEP_INCLUDE_JIT_INSTRUCTIONS, true);
+#if ANGELSCRIPT_VERSION >= 23700
 	engine->SetEngineProperty(asEP_JIT_INTERFACE_VERSION, 2);
+#endif
 	engine->SetEngineProperty(asEP_BUILD_WITHOUT_LINE_CUES, true);
 	ANGELSEA_TEST_CHECK(engine->SetJITCompiler(&jit) >= 0);
 
