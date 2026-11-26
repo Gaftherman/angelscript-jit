@@ -30,6 +30,10 @@
 
 namespace angelsea::detail {
 
+// Script frames up to which a compiled function calls a compiled callee as a native call (see
+// JitConfig::experimental_direct_continue). A native frame of generated code is a few hundred bytes at most.
+constexpr std::size_t MAX_DIRECT_SCRIPT_CALL_DEPTH = 256;
+
 // TODO: fix indent level for all of those that use this...
 
 BytecodeToC::BytecodeToC(const JitConfig& config, asIScriptEngine& engine, std::string c_symbol_prefix) :
@@ -941,23 +945,37 @@ void BytecodeToC::translate_instruction(FnState& state) {
 		// const std::string  fn_symbol = fmt::format("{}_scriptfn{}", m_c_symbol_prefix, fn_idx);
 		asCScriptFunction* virtual_fn = m_script_engine->scriptFunctions[fn_idx];
 
+		// A null object (or, for an interface, one that does not implement it) is left to the VM: it executes this same
+		// instruction again, raises the exception and releases the arguments.
 		if (virtual_fn->funcType == asFUNC_INTERFACE) {
-			// TODO: write tests with a few interfaces then implement
-			emit_vm_fallback(state, "Cannot handle interface calls yet");
-			break;
+			// The method is looked up in the interface's chunk of the virtual function table at run time.
+			const std::string fn_raw_name = fmt::format("{}_scriptfn{}", m_c_symbol_prefix, fn_idx);
+			if (m_on_map_extern_callback) {
+				m_on_map_extern_callback(fn_raw_name.c_str(), ExternScriptFunction{fn_idx}, virtual_fn);
+			}
+			emit_forward_declaration(state, fn_raw_name, "extern char {}[];\n", fn_raw_name);
+			emit(
+			    "\t\tasCScriptFunction* v_fn = (asCScriptFunction*)asea_resolve_virtual_function(sp->as_ptr, "
+			    "(void*)&{FN});\n"
+			    "\t\tif (v_fn == 0) {{ regs->pc = base_pc + {INS_OFFSET}; goto vm; }}\n",
+			    fmt::arg("FN", fn_raw_name),
+			    fmt::arg("INS_OFFSET", ins.offset)
+			);
+			state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
+		} else {
+			emit(
+			    "\t\tasCScriptObject* v_obj = sp->as_ptr;\n"
+			    "\t\tif (v_obj == 0) {{ regs->pc = base_pc + {INS_OFFSET}; goto vm; }}\n"
+			    "\t\tasITypeInfo* v_obj_type = *(asITypeInfo**)((char*)v_obj + {OFF_SCRIPTOBJ_OBJTYPE});\n"
+			    "\t\tasea_array* v_vftable = (asea_array*)((char*)v_obj_type + {OFF_OBJTYPE_VFTABLE});\n"
+			    "\t\tasCScriptFunction* v_fn = ((asCScriptFunction**)(v_vftable->ptr))[{VTABLE_IDX}];\n",
+			    fmt::arg("INS_OFFSET", ins.offset),
+			    fmt::arg("OFF_SCRIPTOBJ_OBJTYPE", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptobj_objtype)),
+			    fmt::arg("OFF_OBJTYPE_VFTABLE", DIRECT_VALUE_IF_POSSIBLE(asea_offset_objtype_vtable)),
+			    fmt::arg("VTABLE_IDX", virtual_fn->vfTableIdx)
+			);
+			state.error_handlers_mask |= std::uint64_t(ErrorHandler::VM_FALLBACK);
 		}
-
-		// FIXME: if v_obj is null then null exception
-
-		emit(
-		    "\t\tasCScriptObject* v_obj = sp->as_ptr;\n"
-		    "\t\tasITypeInfo* v_obj_type = *(asITypeInfo**)((char*)v_obj + {OFF_SCRIPTOBJ_OBJTYPE});\n"
-		    "\t\tasea_array* v_vftable = (asea_array*)((char*)v_obj_type + {OFF_OBJTYPE_VFTABLE});\n"
-		    "\t\tasCScriptFunction* v_fn = ((asCScriptFunction**)(v_vftable->ptr))[{VTABLE_IDX}];\n",
-		    fmt::arg("OFF_SCRIPTOBJ_OBJTYPE", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptobj_objtype)),
-		    fmt::arg("OFF_OBJTYPE_VFTABLE", DIRECT_VALUE_IF_POSSIBLE(asea_offset_objtype_vtable)),
-		    fmt::arg("VTABLE_IDX", virtual_fn->vfTableIdx)
-		);
 		emit_direct_script_call_ins(state, ScriptCallByExpr{.fn_decl = virtual_fn, .expr = "v_fn"});
 		break;
 	}
@@ -1478,14 +1496,44 @@ void BytecodeToC::emit_direct_script_call_ins(FnState& state, std::variant<Scrip
 			);
 		}
 
+		// When the callee returns normally, its RET has already popped its frame and left the registers exactly where
+		// the VM would find them: program counter on the JitEntry that follows this call, same frame pointer. In that
+		// case keep running this function instead of returning to the VM just to be dispatched back in. A callee that
+		// fell back to the VM leaves its own frame behind, so the check fails and we return as before. Beyond a
+		// number of nested script frames the VM drives the call, so deep recursion cannot exhaust the native stack.
+		const std::size_t next_offset = state.ins.offset + state.ins.size();
+		const std::string continue_code
+		    = m_config->experimental_direct_continue && state.branch_targets.contains(next_offset)
+		    ? fmt::format(
+		          "\t\t\tif (regs->pc == base_pc + {NEXT} && (void*)regs->fp == (void*)fp\n"
+		          "\t\t\t    && *(int*)((char*)regs->ctx + {OFF_STATUS}) == asEXECUTION_ACTIVE) {{\n"
+		          "\t\t\t\tsp = regs->sp;\n"
+		          "\t\t\t\tvalue_reg = regs->value;\n"
+		          "\t\t\t\tgoto bc{NEXT};\n"
+		          "\t\t\t}}\n",
+		          fmt::arg("NEXT", next_offset),
+		          fmt::arg("OFF_STATUS", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_status))
+		      )
+		    : std::string{};
+		const auto callstack_guard = fmt::format(
+		    "((asea_array*)((char*)regs->ctx + {OFF_CALLSTACK}))->len < {LIMIT}",
+		    fmt::arg("OFF_CALLSTACK", DIRECT_VALUE_IF_POSSIBLE(asea_offset_ctx_callstack)),
+		    fmt::arg("LIMIT", MAX_DIRECT_SCRIPT_CALL_DEPTH * CALLSTACK_FRAME_SIZE)
+		);
+
 		if (known_fn == state.fn) {
 			if (m_config->c.human_readable) {
 				emit("\t\t/* recursive call */\n");
 			}
 			emit(
-			    "\t\t{SELF}(_regs, 1);\n"
+			    "\t\tif ({GUARD}) {{\n"
+			    "\t\t\t{SELF}(_regs, 1);\n"
+			    "{CONTINUE}"
+			    "\t\t}}\n"
 			    "\t\treturn;\n",
-			    fmt::arg("SELF", m_module_state.fn_name)
+			    fmt::arg("GUARD", callstack_guard),
+			    fmt::arg("SELF", m_module_state.fn_name),
+			    fmt::arg("CONTINUE", continue_code)
 			);
 		} else {
 			// look up JITFunction to branch into directly. if it doesn't exist that's fine; in both case we drop to
@@ -1493,11 +1541,16 @@ void BytecodeToC::emit_direct_script_call_ins(FnState& state, std::variant<Scrip
 			emit(
 			    "\t\tvoid* script_data = *(void**)((char*)({FN}) + {OFF_SCRIPTFN_SCRIPTDATA});\n"
 			    "\t\tasea_jit_fn jit_fn = *(asea_jit_fn*)((char*)script_data + {OFF_SCRIPTDATA_JITFN});\n"
-			    "\t\tif (jit_fn) {{ jit_fn(_regs, 1); return; }}\n"
+			    "\t\tif (jit_fn && {GUARD}) {{\n"
+			    "\t\t\tjit_fn(_regs, 1);\n"
+			    "{CONTINUE}"
+			    "\t\t}}\n"
 			    "\t\treturn;\n",
 			    fmt::arg("FN", fn_expr),
 			    fmt::arg("OFF_SCRIPTFN_SCRIPTDATA", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptfn_scriptdata)),
-			    fmt::arg("OFF_SCRIPTDATA_JITFN", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptdata_jitfunction))
+			    fmt::arg("OFF_SCRIPTDATA_JITFN", DIRECT_VALUE_IF_POSSIBLE(asea_offset_scriptdata_jitfunction)),
+			    fmt::arg("GUARD", callstack_guard),
+			    fmt::arg("CONTINUE", continue_code)
 			);
 		}
 	} else {

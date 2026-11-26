@@ -1,104 +1,61 @@
 # angelscript-jit
 
-> [!IMPORTANT]
-> This is a fork of [asumagic/angelsea](https://github.com/asumagic/angelsea) (BSD-2-Clause). It is alpha quality
-> software, like upstream.
+**[English](README.md)** | **[Español](docs/README.es.md)**
 
-A **JIT compiler for AngelScript** written in C++20 which leverages the
-lightweight [MIR](https://github.com/vnmakarov/mir) JIT runtime and its C11
-compiler. The library, the CMake target (`angelsea`) and the C++ namespace keep
-their upstream names, so changes can go back upstream.
+A JIT compiler for AngelScript, written in C++20 on top of the [MIR](https://github.com/vnmakarov/mir) runtime. Scripts run 6 to 11 times faster than the interpreter on compute-heavy code. This is a maintained fork of [asumagic/angelsea](https://github.com/asumagic/angelsea) (BSD-2-Clause) that keeps the JIT working on the current AngelScript release. It is alpha-quality software, like upstream.
+
+The library, the CMake target (`angelsea`) and the C++ namespace keep their upstream names, so changes can go back upstream.
+
+## Supported releases
+
+The JIT needs the `asIJITCompilerV2` interface, which AngelScript has from 2.37.0. Every release below runs the Catch2 suite and the differential test (the same scripts on the plain VM and with the JIT must give the same output, state and exception).
+
+| AngelScript | Windows x64 | Linux x64 | Linux arm64 | macOS arm64 | macOS x64 | 32-bit x86 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2.39.0 (current) | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
+| 2.38.0 | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
+| 2.37.0 | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
+| 2.36 and earlier | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+- ✅ tested on every push. ⚠️ built and tested in CI as an experimental job. ❌ not supported.
+- Windows is tested with MSVC, Linux with gcc. MinGW and clang work upstream.
+- macOS x64 fails in MIR upstream. 32-bit x86 has no MIR backend: use the interpreter, or the [BlindMind Studios JIT](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler).
+- Releases before 2.37.0 have no V2 interface, so there is no JIT for them yet. [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) tells you which of its builds have the JIT.
 
 ## What this fork adds
 
-The fork exists to keep the JIT working on the **current AngelScript release**
-and to test it on the earlier ones that have the `asIJITCompilerV2` interface.
+- **Script exceptions raised by application functions are no longer lost.** `CScriptArray::At` (an out of bounds index) and any other function that calls `asIScriptContext::SetException` were ignored in direct system calls, because the JIT never set `m_callingSystemFunction`, which `SetException` requires. The script went on with the null reference the callee returned and crashed. The JIT now sets and clears it around direct calls and, like the VM, returns as soon as the context is no longer active.
+- **aarch64 loads and stores at unaligned offsets.** AngelScript aligns object properties to 4 bytes, so a `double` can sit at offset 12. MIR's aarch64 backend could not encode that access and aborted; the fix lives in `vendor/mir`.
+- `hack_ignore_context_inspect` is **off** by default, so the program pointer is saved before direct calls and exceptions report the right line and call stack. Turn it on for speed if your application functions never raise script exceptions or inspect the context.
+- AngelScript 2.37 builds again: `asCScriptFunction::IsVariadic` is 2.38+, and 2.37's `GetDeclaredAt` reads out of bounds for functions without a section.
+- A **differential test** (`tests/differential`). `generate.py --seed N` writes random programs (arithmetic, loops, recursion, classes and interfaces, arrays and strings, try/catch), so a failure can be reproduced from the seed.
+- `vendor/mir` points to a fork of asumagic/mir that carries the aarch64 fix, and `vendor/angelscript` is pinned to v2.39.0.
 
-| AngelScript | Catch2 suite | Differential test | Notes |
-|-------------|--------------|-------------------|-------|
-| 2.39.0 (default, vendored) | ✅ | ✅ | |
-| 2.38.0      | ✅ | ✅ | The version upstream pins. |
-| 2.37.0      | ✅ | ✅ | Needed two fixes, see below. Earlier releases have no `asIJITCompilerV2`. |
+## Status
 
-Tested on Windows x86-64 (MSVC) and Linux x86-64 (gcc). Linux and macOS arm64
-run in CI as experimental jobs.
+We have a test suite run in CI and we test the JIT against a development build of [KAG](https://store.steampowered.com/app/219830/King_Arthurs_Gold). The `main` branch should generally be reasonably stable.
 
-Changes over upstream:
+Compared to the [BlindMind Studios JIT](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler), upstream measured +0~40% runtime performance in a real world application.
 
-- **Script exceptions raised by application functions are no longer lost.**
-  `CScriptArray::At` (an out of bounds index) and any other function that calls
-  `asIScriptContext::SetException` were ignored in direct system calls, because
-  the JIT never set `m_callingSystemFunction`, which `SetException` requires.
-  The script then went on with the null reference the callee returned and
-  crashed. The JIT now sets and clears it around direct calls and, like the VM,
-  returns as soon as the context is no longer active.
-- `hack_ignore_context_inspect` is **off** by default, so the program pointer is
-  saved before direct calls and exceptions report the right line and call stack.
-  Turn it on for speed if your application functions never raise script
-  exceptions or inspect the context.
-- AngelScript 2.37 builds again: `asCScriptFunction::IsVariadic` is 2.38+, and
-  2.37's `GetDeclaredAt` reads out of bounds for functions without a section,
-  which crashed with `JitConfig::c.human_readable`.
-- A **differential test** (`tests/differential`): every script runs once on the
-  plain VM and once with the JIT, and the printed output, final state and
-  exception (with its line) must be identical. `generate.py --seed N` writes
-  random programs (integer and floating-point arithmetic, loops, recursion,
-  classes and interfaces, arrays and strings, try/catch), so a failure can be
-  reproduced from the seed.
-- CI runs both suites against 2.37, 2.38 and 2.39.
-- The `mir` submodule URL is absolute, so the fork builds without a fork of MIR.
+JIT compile times and memory use can be higher than that JIT, however:
 
-## Current status
-
-We have a test suite tested in CI and we test the JIT compiler against a test
-development build of [KAG](https://store.steampowered.com/app/219830/King_Arthurs_Gold).
-
-Angelsea is still in a bit of a "move fast, break things" phase, but the `main`
-branch should generally be reasonably stable.
-
-### Performance
-
-Compared to the [BlindMindStudios JIT](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler),
-we obtain +0~40% runtime performance in a real world application, but YMMV.  
-If you have results to share, we're interested!
-
-#### Compiler performance
-
-Compared to the BMS JIT, Angelsea may have higher JIT compile times and memory
-use, however:
-
-- Lazy compilation is enabled by default.[^1]
-- Asynchronous compilation can be enabled using `Jit::SetCompileCallback`.[^2]
-- Huge functions (~thousands of LoC) are skipped by default.[^3]
-
-[^1]: This effectively means that cold functions can be entirely ignored. In real
-world applications, this can slash down the amount of compiled functions
-very significantly. This is especially true because the `#include` mechanism is
-prone to leaving a bunch of functions effectively unused.
-
-[^2]: This is not a fully multi-threaded process, as only one thread will run
-codegen at once. However, most of the process remains asynchronous, so it is
-largely suitable for real-time apps. It may also improve script loading times
-compared to the BMS JIT.
-
-[^3]: MIR isn't particularly designed for huge functions and as such, memory and
-compute costs can become ridiculous (gigabytes of RAM). We skip compilation past
-a certain bytecode size as a heuristic, which you can adjust.
+- Lazy compilation is enabled by default: cold functions are never compiled.
+- Asynchronous compilation can be enabled using `Jit::SetCompileCallback`. Only one thread runs code generation at once, but most of the process is asynchronous.
+- Huge functions (thousands of lines) are skipped by default, because MIR's cost grows quickly with function size. The limit is adjustable.
 
 ## Supported platforms
 
-|    | OS       | Architecture | ABI   | Tested compilers | Notes |
-|----|----------|--------------|-------|------------------|-|
-| ✅ | Linux    | x86-64       | gcc   | gcc, clang       | Tested on real app |
-| ✅ | Windows  | x86-64       | MinGW | MinGW gcc        | Tested on real app |
-| ✅ | Windows  | x86-64       | MSVC  | cl               | Not tested on real app |
-| ⚠️ | Linux    | aarch64      | gcc   | clang            | Not tested on real app, considered experimental |
-| ⚠️ | macOS    | aarch64      | Apple | Apple clang      | Not tested on real app, considered experimental |
-| ❌ | macOS    | x86-64       | Apple | Apple clang      | Fails CI. Voice interest if you would like it fixed. See [#3](https://github.com/asumagic/angelsea/issues/3) |
-| ❌ | —        | 32-bit x86   | —     |                  | Not supported by MIR. Please use [BlindMindStudio's JIT](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler) |
-| ❓ | Linux    | riscv64      | gcc   |                  | Supported by MIR, but not tested. |
-| ❓ | Linux    | ppc64le      | gcc   |                  | Supported by MIR, but not tested. |
-| ❌ | Linux    | s390x        | gcc   |                  | Supported by MIR, but big-endian is not supported by angelsea. |
+|    | OS       | Architecture | ABI   | Notes |
+|----|----------|--------------|-------|-------|
+| ✅ | Linux    | x86-64       | gcc   | Tested on a real application upstream |
+| ✅ | Windows  | x86-64       | MSVC  | Tested here on every push |
+| ✅ | Windows  | x86-64       | MinGW | Tested on a real application upstream |
+| ⚠️ | Linux    | aarch64      | gcc   | Experimental |
+| ⚠️ | macOS    | aarch64      | Apple | Experimental |
+| ❌ | macOS    | x86-64       | Apple | Fails in MIR. See [asumagic/angelsea#3](https://github.com/asumagic/angelsea/issues/3) |
+| ❌ | —        | 32-bit x86   | —     | MIR has no backend |
+| ❓ | Linux    | riscv64, ppc64le | gcc | Supported by MIR, not tested |
+| ❌ | Linux    | s390x        | gcc   | Big-endian is not supported |
 
 ## Clone & Build
 
@@ -290,160 +247,21 @@ For an example that leverages script builder metadata, see [`tests/configtest.cp
 > The JIT compiler itself is not currently thread-safe with regards to
 > multithreaded AngelScript contexts or engines.
 
-### License notice
-
-As of writing:
-
-- **Angelsea is licensed under the [BSD-2-Clause license](LICENSE)**.
-- MIR is licensed under the [MIT license](https://github.com/vnmakarov/mir/blob/master/LICENSE).
-- AngelScript is licensed under the zlib license.
-- libfmt is licensed under the [MIT license](https://github.com/fmtlib/fmt/blob/master/LICENSE) (with optional exception).
-
-Those all have very similar permissive terms, but remember to give attribution
-in source **and** binary distributions!
-
 ## Documentation
 
-- [Running the test suite](doc/TESTS.md)
+- [Running the test suite](docs/TESTS.md)
+- [How it works and why](docs/DESIGN.md): the C backend, calling conventions, MIR and the other JIT compilers
+- [Contributing](CONTRIBUTING.md)
+- [Third-party notices](docs/THIRD_PARTY.md)
 
-## Q&A
+## Related projects
 
-### How does the JIT compiler work?
+| Project | Use |
+| --- | --- |
+| [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) | Run, check and debug scripts from the terminal. Its JIT builds use this repository |
+| [angelscript-engine](https://github.com/Gaftherman/angelscript-engine) | Patched SDK builds of older AngelScript releases |
+| [asumagic/angelsea](https://github.com/asumagic/angelsea) | The upstream project |
 
-AngelScript uses a bytecode virtual machine, so a JIT compiler has to take this
-bytecode and translate some or all of it to native code.  
-Bytecode functions have one or more "JIT entry points" from which a JIT function
-can start. This effectively allows JIT functions to drop down to the VM for
-unsupported instructions, but still making it possible to be called again.
+## License
 
-Angelsea compiles AngelScript bytecode to C functions. c2mir compiles that to
-MIR in memory, and MIR ultimately emits machine code.
-
-Lazy compilation works by giving AngelScript dummy JIT functions that merely
-count how often they were called. Once the configurable threshold is reached,
-compilation will be triggered, potentially asynchronously.
-
-### What is the best supported calling convention?
-
-Currently, the `asCALL_GENERIC` calling convention is the best supported (though
-some things are not covered).
-
-There is experimental support for the native calling convention (on by default).
-Many cases should be covered, but some are omitted.
-
-Supported system calls are much faster with the JIT with either the generic or
-native calling convention.
-
-There is also an experimental "stack elision" optimization
-(`experimental_stack_elision`) that can improve the native calling convention
-performance by bypassing stack pushes entirely when possible.
-
-As of writing, `asIScriptGeneric` is not a particularly efficient interface (see
-below), but when the time comes, we may try to contribute back design
-improvements for it.
-
-<details>
-<summary>Elaborating on the generic calling convention</summary>
-
-`asIScriptGeneric` is a rather slow interface by design. You might think that
-the native calling convention (e.g. `asCALL_CDECL` and all) might be faster, but
-it's not actually obvious why that would be true. In stock AngelScript (i.e. no
-JIT), the native convention is actually fairly slow as it needs to go through
-native shims that are fairly complex due to needing to handle arbitrary
-signatures, resulting in a rather impressive pile of C++ ABI emulation for each
-unique platform.
-
-AngelScript tries to be clever about this in some cases (e.g. `asBC_Thiscall1`),
-but native calls otherwise carry more overhead than you might think.
-
-In essence, the native calling convention actually fundamentally has to do
-_more_ work than the generic calling convention! In both cases, all arguments
-live on the AS stack either way, and have to be pulled out of it sooner or
-later. Whether AS itself or your app need to look up those arguments doesn't
-really matter.
-
-That being said, the generic calling convention *is* actually somewhat slow
-out-of-the-box in AngelScript, but this is not an unsolvable problem.  
-The callee (your code) needs to do, for _every_ argument or other call to the
-generic, a virtual function call. This is usually not outrageously expensive,
-but it prevents inlining despite the functions being (overall) not very
-expensive each.  
-Worse, some functions also do a lot of work and e.g. need to look up the
-script function type information and then loop over arguments,
-_for every argument lookup you do_.
-
-When automatically wrapping functions for the generic calling convention, it
-actually is feasible to hack a lot of that complexity away by directly poking at
-`asCGeneric`.
-
-Angelsea is able to make generic calls much faster by doing a lot less work than
-the AngelScript VM, though, largely thanks to the fact we can generate code
-tailored for each function, skipping steps and branches we know are
-unnecessary. It also has some hacks like pooling the `asCGeneric` objects at
-function level to skip reinitialization of fields that never change.  
-This allows angelsea to give a ~5x performance uplift for a 1 million generic
-calls benchmark.
-
-</details>
-
-### Why generate C instead of MIR?
-
-It actually makes a lot of sense to take this "lazy" approach.
-
-1. Our bytecode2c compiler generates standard (enough) C code. Entry points use
-the `asJITFunction` signature. We also try to resolve all references to pointers
-baked in the bytecode and forward detailed information via a callback.  
-Fundamentally, nothing about the codegen is really specific to JIT or even to
-MIR...
-2. ... So nothing really prevents you from AOT compiling AngelScript code to C
-using bytecode2c for release builds, which might be interesting for consoles and
-certain platforms (e.g. iOS) which notoriously ban JITs. You still would need
-the interpreter (if only because Angelsea will fallback to it), but in theory,
-all you would need to do is use bytecode2c with appropriate symbol callbacks,
-and add some glue code by implementing your own `asIJITCompiler` that map JIT
-entry points to C++. (This isn't really an easy task yet, and there are _still_
-some prerequisite refactors before this is viable, but the overall design
-fundamentally allows it.)
-3. In theory, it enables the ability to inject native C code. Because MIR is
-capable of inlining functions, they could be made to implement
-performance-sensitive things like some array calls and avoid a native function
-call. (This would still be feasible even if we generated MIR directly, but it is
-an advantage of using C.)
-4. Generated C code is a lot like the VM code. This is fairly quick to do and is
-surprisingly human-readable even to people with no prior compilation experience.
-    - We do take more care with strict aliasing rules than AS does, though.
-5. The fact we can just speak C greatly simplifies interfacing with script
-engine structures. Dealing with the C++ ABI (such as for certain native function
-calls, or to call virtual AS engine functions) would be annoying, but we can
-work around it to some extent.
-6. In theory, it does mean we can leverage native tooling such as
-AddressSanitizer and static analysis to debug JIT bugs.
-
-### What about other JIT compilers?
-
-- [BlindMindStudio's JIT compiler](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler)
-served its purpose, but it is unmaintained (although people have forked it), has
-way suboptimal and x86-only code generation, falls back to the interpreter
-often (in our usecase), and contains subtle bugs.
-- I previously worked on [asllvm](https://github.com/asumagic/asllvm).
-It was a functional proof-of-concept (in fact some of angelsea's infrastructure
-originates from it), but it was way too large in scope. It more or less intended
-to take over the entire interpreter, which meant total coverage of *all* of AS'
-low-level semantics before it was any useful. This is doubly a problem, because
-to speak the C ABI -- let alone the C++ ABI -- you basically need to do it
-yourself AFAIK. Besides, LLVM is _huge_, breaks API compatibility on almost
-every major update, and is rather unreasonable for an embeddable language.
-- Hazelight's UnrealEngine-AngelScript is way more involved than I thought and
-includes a [C++ AOT transpiler](https://github.com/Hazelight/UnrealEngine-Angelscript/tree/e1bdb40e97da880ae907030dda65639d5a4b7b3d/Engine/Plugins/Angelscript/Source/AngelscriptCode/Private/StaticJIT).
-To my understanding it is tightly coupled to that project and its fork of AS,
-and does not feature an actual JIT compiler.
-- There is an [AOT compiler](https://github.com/quarnster/asaot), but it is
-unmaintained and I don't know what it is worth nowadays. Due to its approach, if
-AOT is fine for you, it might actually make sense to use.
-
-To my knowledge, there is no other (public...) project of that kind.
-
-### Why this name?
-
-I was looking for puns with "mir" or "mimir" and miserably failed, so all you
-get is Angel→C, which seems memorable enough.
+[BSD-2-Clause](LICENSE), like upstream. Third-party notices are in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).

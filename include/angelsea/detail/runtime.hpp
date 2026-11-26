@@ -73,6 +73,12 @@ void asea_clean_args(asSVMRegisters* vm_registers, asCScriptFunction& fn, asDWOR
 /// \brief Casts script object \ref obj to the requested \ref type_id; stores result in object register
 void asea_cast(asSVMRegisters* vm_registers, asCScriptObject* obj, asDWORD type_id);
 
+/// \brief Finds the script function that \ref fn (a virtual method or an interface method) resolves to for the dynamic
+/// type of \ref obj, like `asCContext::CallInterfaceMethod` does. Returns null when \ref obj is null or does not
+/// implement the interface; nothing has been changed then, so the caller can let the VM execute the call and raise the
+/// exception.
+asCScriptFunction* asea_resolve_virtual_function(asCScriptObject* obj, asCScriptFunction* fn);
+
 /// \brief Heap-allocate a new script object and construct it, then return the pointer to it. The caller should still be
 /// calling the scripted constructor for that object.
 [[gnu::hot]]

@@ -37,6 +37,7 @@ static void bind_runtime(Mir& mir) {
 	ASEA_BIND_MIR(asea_set_internal_exception);
 	ASEA_BIND_MIR(asea_clean_args);
 	ASEA_BIND_MIR(asea_cast);
+	ASEA_BIND_MIR(asea_resolve_virtual_function);
 	ASEA_BIND_MIR(asea_alloc);
 	ASEA_BIND_MIR(asea_free);
 	ASEA_BIND_MIR(asea_new_script_object);

@@ -4,15 +4,28 @@ name: CI
 #  - the Catch2 suite (benchmarks excluded);
 #  - the differential host: the same scripts on the plain VM and with the JIT must print the same output,
 #    on a fixed corpus and on scripts generated from a seed.
+# A change that only touches documentation builds nothing; a branch with a pull request builds once, and a
+# newer run of the same branch cancels the older one.
 on:
   push:
-    branches: ['*']
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   pull_request:
-    branches: ['*']
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -41,6 +54,12 @@ jobs:
       - name: Install Ninja
         shell: bash
         run: python -m pip install ninja
+      - name: Reuse the downloaded release
+        if: matrix.angelscript != '2.39.0'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sdk-cache
+          key: angelcode-${{ matrix.angelscript }}
       - name: Fetch a patched SDK for 2.37 and 2.38
         if: matrix.angelscript != '2.39.0'
         shell: bash
@@ -64,7 +83,7 @@ jobs:
         run: |
           for seed in 1 2 3; do
             python differential/generate.py --seed "$seed" --count 120 --out "$RUNNER_TEMP/gen$seed"
-            ../build/tests/angelsea-differential "$RUNNER_TEMP/gen$seed"/*.as
+            ../build/tests/angelsea-differential "$RUNNER_TEMP/gen$seed"
           done
           # The scripts of the Catch2 suite hold several test functions each: --all runs every `void f()`.
           ctest --test-dir ../build/tests -R differential --output-on-failure

@@ -12,11 +12,14 @@
 #include <scriptbuilder/scriptbuilder.h>
 #include <scriptstdstring/scriptstdstring.h>
 
+#include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -53,6 +56,7 @@ struct Result {
 	std::string error;
 	int         state = -1;
 	std::size_t hints = 0;
+	double      milliseconds = 0; // time spent running the entry points, not building or compiling
 };
 
 struct Options {
@@ -61,6 +65,7 @@ struct Options {
 	asEBCInstr                fallback_after = asEBCInstr(-1);
 	bool                      verbose        = false;
 	bool                      all            = false; // run every global `void f()` instead of one entry point
+	int                       time_runs      = 0;     // > 0: also report the best of that many timed runs
 	int                       only           = 0; // 1: only the VM, 2: only the JIT (for narrowing a crash down)
 };
 
@@ -90,6 +95,7 @@ Result run_once(const std::string& path, const Options& options, bool with_jit) 
 	config.log_targets.verbose            = asEMsgType(-1);
 	config.c.human_readable               = std::getenv("ASEA_HUMAN") != nullptr;
 	config.hack_ignore_exceptions         = std::getenv("ASEA_STRICT_EXC") == nullptr;
+	config.experimental_direct_continue   = std::getenv("ASEA_NO_CONTINUE") == nullptr;
 	config.debug.dump_c_code              = std::getenv("ASEA_DUMP_C") != nullptr;
 	config.debug.blacklist_instructions   = options.blacklist;
 	config.debug.fallback_after_instruction = options.fallback_after;
@@ -132,7 +138,10 @@ Result run_once(const std::string& path, const Options& options, bool with_jit) 
 			for (asIScriptFunction* function : entries) {
 				asIScriptContext* context = engine->CreateContext();
 				context->Prepare(function);
-				const int   state = context->Execute();
+				const auto  started = std::chrono::steady_clock::now();
+				const int   state   = context->Execute();
+				result.milliseconds
+				    += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 				std::string note;
 				if (state == asEXECUTION_EXCEPTION) {
 					const char* text = context->GetExceptionString();
@@ -187,10 +196,22 @@ int main(int argc, char** argv) {
 			options.fallback_after = asEBCInstr(std::atoi(argv[++i]));
 		} else if (arg == "--only" && i + 1 < argc) {
 			options.only = std::string_view(argv[++i]) == "vm" ? 1 : 2;
+		} else if (arg == "--time" && i + 1 < argc) {
+			options.time_runs = std::atoi(argv[++i]);
 		} else if (arg == "--all") {
 			options.all = true;
 		} else if (arg == "--verbose") {
 			options.verbose = true;
+		} else if (std::filesystem::is_directory(std::filesystem::path(std::string(arg)))) {
+			// A folder stands for every script in it, in name order, so no shell has to expand a pattern.
+			std::vector<std::string> found;
+			for (const auto& entry : std::filesystem::directory_iterator(std::string(arg))) {
+				if (entry.path().extension() == ".as") {
+					found.push_back(entry.path().string());
+				}
+			}
+			std::sort(found.begin(), found.end());
+			scripts.insert(scripts.end(), found.begin(), found.end());
 		} else {
 			scripts.emplace_back(arg);
 		}
@@ -208,6 +229,15 @@ int main(int argc, char** argv) {
 		const bool   same = valid && vm.out == jit.out && vm.state == jit.state && vm.error == jit.error;
 		std::cout << (same ? "ok       " : valid ? "MISMATCH " : "INVALID  ") << script << "  (jit notes: " << jit.hints
 		          << ")\n";
+		if (same && options.time_runs > 0 && options.only == 0) {
+			// Best of N, so a noisy machine does not decide the result.
+			double vm_best = vm.milliseconds, jit_best = jit.milliseconds;
+			for (int run = 1; run < options.time_runs; ++run) {
+				vm_best  = std::min(vm_best, run_once(script, options, false).milliseconds);
+				jit_best = std::min(jit_best, run_once(script, options, true).milliseconds);
+			}
+			std::printf("  time     vm %9.2f ms   jit %9.2f ms   x%.2f\n", vm_best, jit_best, vm_best / jit_best);
+		}
 		if (!same) {
 			++mismatches;
 			std::cout << "  vm : state=" << vm.state << " error=[" << vm.error << "] out=" << vm.out.size() << " bytes\n"

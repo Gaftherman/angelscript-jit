@@ -180,6 +180,26 @@ void asea_cast(asSVMRegisters* vm_registers, asCScriptObject* obj, asDWORD type_
 	}
 }
 
+asCScriptFunction* asea_resolve_virtual_function(asCScriptObject* obj, asCScriptFunction* fn) {
+	if (obj == nullptr) {
+		return nullptr;
+	}
+
+	asCObjectType* type = obj->objType;
+	if (fn->funcType != asFUNC_INTERFACE) {
+		return type->virtualFunctionTable[fn->vfTableIdx];
+	}
+
+	// An interface method lives in the chunk of the virtual function table that belongs to that interface
+	for (asUINT n = 0; n < type->interfaces.GetLength(); ++n) {
+		if (type->interfaces[n] == fn->objectType) {
+			return type->virtualFunctionTable[fn->vfTableIdx + type->interfaceVFTOffsets[n]];
+		}
+	}
+
+	return nullptr;
+}
+
 void* asea_new_script_object(asCObjectType* obj_type) {
 	auto* mem = static_cast<asCScriptObject*>(asea_alloc(obj_type->size));
 	ScriptObject_Construct(obj_type, mem);

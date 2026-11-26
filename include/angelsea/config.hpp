@@ -160,6 +160,12 @@ struct JitConfig {
 	/// yet. This is subject to breakage with AngelScript updates.
 	bool experimental_fast_script_call = true;
 
+	/// After a call to a script function that is also compiled, keep running the caller when the callee returns,
+	/// instead of going back to the VM and being dispatched in again. It only applies while the script call stack
+	/// is shallow: deeper calls go through the VM, so deep recursion cannot exhaust the native stack. Requires
+	/// `experimental_fast_script_call`.
+	bool experimental_direct_continue = true;
+
 	/// Speeds up the generic calling convention by replacing complex call runtime logic with code generation. This is
 	/// subject to breakage with AngelScript updates. It also tries to be clever with the C++ ABI (as it has to populate
 	/// the vtable pointer for asCGeneric correctly), which could be prone to breakage.
