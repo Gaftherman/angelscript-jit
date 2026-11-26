@@ -12,14 +12,14 @@ El JIT necesita la interfaz `asIJITCompilerV2`, que AngelScript tiene desde la 2
 
 | AngelScript | Windows x64 | Linux x64 | Linux arm64 | macOS arm64 | macOS x64 | x86 de 32 bits |
 | --- | --- | --- | --- | --- | --- | --- |
-| 2.39.0 (actual) | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
+| 2.39.0 (actual) | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | solo AOT |
 | 2.38.0 | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
 | 2.37.0 | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
 | 2.36 y anteriores | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 - ✅ probado en cada push. ⚠️ se compila y prueba en CI como trabajo experimental. ❌ no compatible.
 - Windows se prueba con MSVC y Linux con gcc. MinGW y clang funcionan en el original.
-- macOS x64 falla en MIR. El x86 de 32 bits no tiene backend en MIR: usa el intérprete o el [JIT de BlindMind Studios](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler).
+- macOS x64 falla en MIR; hay un job de CI experimental. El x86 de 32 bits no tiene backend en MIR, así que allí el JIT se compila sin él (`ASEA_NO_MIR`, automático con punteros de 32 bits) y solo funciona la vía AOT. Alternativa en 32 bits: el [JIT de BlindMind Studios](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler).
 - Las versiones anteriores a la 2.37.0 no tienen la interfaz V2, así que todavía no hay JIT para ellas. [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) indica cuáles de sus compilaciones llevan el JIT.
 
 ## Qué añade este fork
@@ -28,6 +28,7 @@ El JIT necesita la interfaz `asIJITCompilerV2`, que AngelScript tiene desde la 2
 - **Lecturas y escrituras en aarch64 con desplazamientos sin alinear.** AngelScript alinea las propiedades de un objeto a 4 bytes, así que un `double` puede quedar en el desplazamiento 12. El backend aarch64 de MIR no sabía codificar ese acceso y abortaba; el arreglo está en `vendor/mir`.
 - `hack_ignore_context_inspect` está **desactivado** por defecto, así que el puntero de programa se guarda antes de las llamadas directas y las excepciones indican la línea y la pila de llamadas correctas. Actívalo por velocidad si tus funciones nunca lanzan excepciones de script ni inspeccionan el contexto.
 - AngelScript 2.37 vuelve a compilar: `asCScriptFunction::IsVariadic` existe desde la 2.38, y `GetDeclaredAt` de la 2.37 lee fuera de rango en funciones sin sección.
+- **Interfaz JIT V1 y AOT.** Las versiones 2.31.2 a 2.36.1 funcionan mediante `asIJITCompiler`. `Jit::ExportModuleC` escribe el C de un módulo para compilarlo por adelantado con clang o gcc en una biblioteca compartida, y `Jit::LoadAot` la instala (sin compilar con MIR al arrancar; `nbody` un 25% más rápido que el código de MIR). Véase `docs/DESIGN.md` (en inglés).
 - Una **prueba diferencial** (`tests/differential`). `generate.py --seed N` escribe programas aleatorios (aritmética, bucles, recursión, clases e interfaces, arreglos y cadenas, try/catch), de modo que un fallo se reproduce con la semilla.
 - `vendor/mir` apunta a un fork de asumagic/mir que lleva el arreglo de aarch64, y `vendor/angelscript` está fijado a la v2.39.0.
 
@@ -53,7 +54,7 @@ El tiempo de compilación y la memoria del JIT pueden ser mayores que los de ese
 | ⚠️ | Linux    | aarch64      | gcc   | Experimental |
 | ⚠️ | macOS    | aarch64      | Apple | Experimental |
 | ❌ | macOS    | x86-64       | Apple | Falla en MIR. Ver [asumagic/angelsea#3](https://github.com/asumagic/angelsea/issues/3) |
-| ❌ | —        | x86 de 32 bits | —   | MIR no tiene backend |
+| ⚠️ | Windows, Linux | x86 de 32 bits | MSVC, gcc | Solo AOT: MIR no tiene backend; las bibliotecas AOT funcionan (29 de 29 scripts del corpus en ambos) |
 | ❓ | Linux    | riscv64, ppc64le | gcc | MIR lo admite, sin probar |
 | ❌ | Linux    | s390x        | gcc   | No se admite big-endian |
 
@@ -65,6 +66,7 @@ La compilación (con las dependencias incluidas o propias, como biblioteca está
 
 - [Cómo ejecutar las pruebas](TESTS.md)
 - [Cómo funciona y por qué](DESIGN.md) (en inglés)
+- [Benchmarks](BENCHMARKS.md) (en inglés): velocidad frente al intérprete, a C++ nativo y a otros JIT, y sus límites
 - [Cómo contribuir](CONTRIBUTING.es.md)
 - [Avisos de terceros](THIRD_PARTY.md)
 

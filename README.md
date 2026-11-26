@@ -8,19 +8,22 @@ The library, the CMake target (`angelsea`) and the C++ namespace keep their upst
 
 ## Supported releases
 
-The JIT needs the `asIJITCompilerV2` interface, which AngelScript has from 2.37.0. Every release below runs the Catch2 suite and the differential test (the same scripts on the plain VM and with the JIT must give the same output, state and exception).
+The JIT implements both JIT interfaces: `asIJITCompilerV2` (AngelScript 2.37.0 and later) and `asIJITCompiler`, version 1 (2.31.2 to 2.36.1). Every release marked below runs the differential test (the same scripts on the plain VM and with the JIT must give the same output, state and exception); 2.37.0 and later also run the Catch2 suite.
 
 | AngelScript | Windows x64 | Linux x64 | Linux arm64 | macOS arm64 | macOS x64 | 32-bit x86 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 2.39.0 (current) | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
+| 2.39.0 (current) | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | AOT only |
 | 2.38.0 | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
 | 2.37.0 | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ |
-| 2.36 and earlier | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| 2.36.1 to 2.33.0 (interface V1) | 🧪 | 🧪 | | | ❌ | ❌ |
+| 2.32.0 and 2.31.2 (interface V1) | 🧪 | | | | ❌ | ❌ |
+| 2.30.2 and earlier | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-- ✅ tested on every push. ⚠️ built and tested in CI as an experimental job. ❌ not supported.
+- AOT only: no runtime compiler (MIR has no 32-bit backend); functions run in the interpreter unless an ahead-of-time library built from `Jit::ExportModuleC` is loaded.
+- ✅ tested on every push. ⚠️ built and tested in CI as an experimental job. 🧪 checked by hand against the differential corpus and the benchmarks, not in CI yet (Linux: 2.35.1 only). ❌ not supported.
 - Windows is tested with MSVC, Linux with gcc. MinGW and clang work upstream.
-- macOS x64 fails in MIR upstream. 32-bit x86 has no MIR backend: use the interpreter, or the [BlindMind Studios JIT](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler).
-- Releases before 2.37.0 have no V2 interface, so there is no JIT for them yet. [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) tells you which of its builds have the JIT.
+- macOS x64 fails in MIR upstream; a CI job for it runs as experimental. 32-bit x86 has no MIR backend, so there the JIT is built without it (`ASEA_NO_MIR`, automatic when pointers are 32 bits) and only the ahead-of-time path works: see [Benchmarks](docs/BENCHMARKS.md). The alternative on 32-bit is the [BlindMind Studios JIT](https://github.com/BlindMindStudios/AngelScript-JIT-Compiler).
+- Releases before 2.37.0 use the version 1 interface through a small adapter (`Jit::CompileFunction`): functions are registered when the engine finishes them and compiled lazily, as in V2. The engine does not say which function a released JIT function belonged to, so records of functions discarded with their module stay until the engine is destroyed. 2.30.2 and earlier do not build (`asITypeInfo` and the type layout differ). Releases below 2.33 have no `try`/`catch`, so the differential scripts that use it do not run there. [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) tells you which of its builds have the JIT.
 
 ## What this fork adds
 
@@ -28,6 +31,9 @@ The JIT needs the `asIJITCompilerV2` interface, which AngelScript has from 2.37.
 - **aarch64 loads and stores at unaligned offsets.** AngelScript aligns object properties to 4 bytes, so a `double` can sit at offset 12. MIR's aarch64 backend could not encode that access and aborted; the fix lives in `vendor/mir`.
 - `hack_ignore_context_inspect` is **off** by default, so the program pointer is saved before direct calls and exceptions report the right line and call stack. Turn it on for speed if your application functions never raise script exceptions or inspect the context.
 - AngelScript 2.37 builds again: `asCScriptFunction::IsVariadic` is 2.38+, and 2.37's `GetDeclaredAt` reads out of bounds for functions without a section.
+- **VM variables live in registers** (`experimental_register_locals`) and script calls to a known callee are set up inline: numeric loops run up to 2.5 times faster than before and `fib` 16-20% faster. See [Benchmarks](docs/BENCHMARKS.md).
+- **JIT interface V1 and AOT.** Releases 2.31.2 to 2.36.1 run through `asIJITCompiler`. `Jit::ExportModuleC` writes the C of a module so you can compile it ahead of time with clang or gcc into a shared library, and `Jit::LoadAot` installs it (no MIR compile at start-up; `nbody` 25% faster than the MIR code). See `docs/DESIGN.md`.
+- Three MIR defects fixed in `vendor/mir` (operand renumbering after a copy-propagation swap, an operand overflow in the spill rewrite, a silent assertion abort on aarch64).
 - A **differential test** (`tests/differential`). `generate.py --seed N` writes random programs (arithmetic, loops, recursion, classes and interfaces, arrays and strings, try/catch), so a failure can be reproduced from the seed.
 - `vendor/mir` points to a fork of asumagic/mir that carries the aarch64 fix, and `vendor/angelscript` is pinned to v2.39.0.
 
@@ -53,7 +59,7 @@ JIT compile times and memory use can be higher than that JIT, however:
 | ⚠️ | Linux    | aarch64      | gcc   | Experimental |
 | ⚠️ | macOS    | aarch64      | Apple | Experimental |
 | ❌ | macOS    | x86-64       | Apple | Fails in MIR. See [asumagic/angelsea#3](https://github.com/asumagic/angelsea/issues/3) |
-| ❌ | —        | 32-bit x86   | —     | MIR has no backend |
+| ⚠️ | Windows, Linux | 32-bit x86 | MSVC, gcc | AOT only: no MIR backend, ahead-of-time libraries run (29 of 29 corpus scripts on both) |
 | ❓ | Linux    | riscv64, ppc64le | gcc | Supported by MIR, not tested |
 | ❌ | Linux    | s390x        | gcc   | Big-endian is not supported |
 
@@ -251,6 +257,7 @@ For an example that leverages script builder metadata, see [`tests/configtest.cp
 
 - [Running the test suite](docs/TESTS.md)
 - [How it works and why](docs/DESIGN.md): the C backend, calling conventions, MIR and the other JIT compilers
+- [Benchmarks](docs/BENCHMARKS.md): speed against the interpreter, native C++, upstream angelsea and BlindMind, and the limits
 - [Contributing](CONTRIBUTING.md)
 - [Third-party notices](docs/THIRD_PARTY.md)
 

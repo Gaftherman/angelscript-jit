@@ -141,3 +141,121 @@ To my knowledge, there is no other (public...) project of that kind.
 
 I was looking for puns with "mir" or "mimir" and miserably failed, so all you
 get is Angel→C, which seems memorable enough.
+
+## JIT interface V1
+
+Releases before 2.37 call `asIJITCompiler::CompileFunction(function, &output)` when a function is finished, where
+2.37+ calls `asIJITCompilerV2::NewFunction`. The adapter registers the function exactly as `NewFunction` does. The
+counting entry point is installed through `MirJit::set_jit_function`, which writes `scriptData->jitFunction` directly
+on V1 releases (the engine reads that field in `asBC_JitEntry`; `SetJITFunction` only exists from 2.37).
+`ReleaseJITFunction` does nothing: the code lives in MIR, and a V1 engine does not say which function it releases.
+Everything else that differs between releases is behind macros and helpers in `include/angelsea/detail/compat.hpp`.
+The object variables that start out null come from `objVariablePos` before 2.36, because the variable table has
+neither temporaries nor the `onHeap` flag there.
+
+## AOT (ahead of time)
+
+`Jit::ExportModuleC(module, base)` runs the translator over a whole module (one translation unit, one set of runtime
+declarations) and writes `<base>.c` and `<base>.externs`. You compile the C with any compiler that accepts GNU
+extensions (clang or gcc, `-shared -O2 -DASEA_SUPPORT=1`, plus `-DASEA_ABI_MSVC=1` on Windows), which gives a library,
+and `Jit::LoadAot(module, library, manifest)` installs its entry points in a module built by the same script.
+
+How the generated code stays free of run-specific addresses: the MIR path hands every address (script functions, native
+functions, type infos, global variables, string constants, the callee bytecode, the runtime helpers) to the linker by
+name. `aot_redirect_externs` (`src/angelsea/detail/aot.cpp`) rewrites each declaration of such a symbol into a macro that
+reads `asea_aot_ext[i]` with the declared type, and the library exports that table, the symbol names and the entry points
+(`asea_aot_ext`, `asea_aot_ext_names`, `asea_aot_functions`). The manifest gives every extern a kind and a key that is
+stable between runs: the declaration for functions and bytecode, `namespace::name` for globals, the hex of the characters
+for string constants, the type declaration for types.
+
+`LoadAot` resolves every symbol before it touches anything (a missing one rejects the whole library), checks each function
+against a hash of its instruction stream (a function changed since the export is skipped and keeps running in the VM or
+MIR), writes the `JitEntry` numbers the translator chose, drops the function from the lazy list and installs the entry
+point. The library is rejected when `ANGELSCRIPT_VERSION` differs, because the generated code uses the engine's
+structure offsets directly (`emit_hardcoded_vm_offsets`), so a library is also tied to the build of the engine and the
+compiler ABI it was made for.
+
+Limits: only script functions and methods of the module are exported. The export was built with clang (Windows x64)
+and gcc 13 (Linux x64) and not tried with MSVC or on arm64 and macOS. `tests/aot/run.sh` exports, builds, loads and
+compares every script of the corpus against the VM running only AOT code: every runnable script matches on both
+platforms (29 on Linux).
+
+### 32-bit targets (no MIR)
+
+MIR has no 32-bit backend, so when `CMAKE_SIZEOF_VOID_P` is 4 (or with `-DASEA_NO_MIR=ON`) the build defines
+`ASEA_NO_MIR`: `mirjit.cpp` keeps the bytecode to C translation, `ExportModuleC` and `LoadAot` and drops everything that
+touches MIR; `register_function` does nothing, so functions stay in the interpreter until `LoadAot` installs library
+code. The translator is the same on every target; only the step that turns the C into machine code changes.
+
+What the translator assumes about the target, and where it is handled:
+
+- Pointer-sized operands use `AS_PTR_SIZE` and `sizeof(asPWORD)` (`var_types::pword` and `void_ptr` were 8 bytes); an
+  immediate of `asPWORD` is an `Immediate` of the integer of the same width, because `asPWORD` is its own type on 32-bit.
+- The ABI ladder in the generated C selects the application-call code with the compiler's own macros, and falls back to
+  the generic ABI (`this` is the first stack argument, which is the Itanium i386 convention, so gcc and clang work).
+  MSVC x86 has `AbiMask::WINDOWS_MSVC_X86`: C has no `__thiscall`, but `thiscall` is ECX for `this` and the rest on the
+  stack, which `__fastcall(this, dummy, args...)` reproduces exactly. Virtual `thiscall` and by-value object returns use
+  the runtime helper on those targets.
+- `tests/aot/msvc_shim.h` picks the width of `size_t`/`uintptr_t` from `_WIN64`; `tests/aot/run.sh` passes
+  `/DASEA_ABI_MSVC=1` only for x64 targets (`VSCMD_ARG_TGT_ARCH`).
+
+A runtime compiler for 32-bit (TinyCC in-process) was measured and rejected, see `docs/BENCHMARKS.md`.
+
+## Register locals
+
+When `JitConfig::experimental_register_locals` is enabled (the default), a
+per-function pre-pass promotes eligible AngelScript frame slots (`fp - offset`)
+to function-scoped scalar C locals (`asea_v_N`, or `asea_v_mN` for negative
+parameter offsets). Scalar C locals are used rather than `union asea_var`
+locals because `c2mir` places aggregates on the C stack and MIR memory GVN is
+disabled below optimization level 3; type-punned accesses to the same slot
+(such as `SetV8` initializing a `double` slot or mixed-type temporary reuse)
+convert via `asea_i2f_inst` / `asea_i2f64_inst` as needed.
+
+### Eligibility rules
+
+An offset is promoted only if all of the following hold:
+- Every access in the bytecode uses a constant frame offset with the same size
+  class: 4-byte (`u32`, `s32`, `f32`, `u8`, `s8`, `u16`, `s16`) or 8-byte
+  (`u64`, `s64`, `f64`, and `pword` on 64-bit targets).
+- The offset is never reached through `frame_ptr(...)` (`PSF`, `LDV`,
+  `LOADOBJ`, `STOREOBJ`, `LoadVObjR`, `RDR1`, `RDR2`, `NOT`, `iTOb`, `iTOw`),
+  taken by address (`FREE`, `RefCpyV`), pushed indirectly (`VAR` for
+  `GETOBJ`/`GETOBJREF`/`GETREF`), or referenced by an unsupported fallback
+  instruction.
+- It does not overlap any other accessed or disqualified slot (an 8-byte slot at
+  `N` occupies dword slots `N` and `N - 1` in `fp - offset` coordinates).
+- It is not covered by an object, handle, funcdef, or `onHeap` variable in
+  `asCScriptFunction::scriptData->variables` (which the VM cleans up during
+  exception unwinding), nor the hidden `DoesReturnOnStack()` return-pointer
+  slot.
+- Parameters (`offset <= 0`, including `this` at `0`) follow the same rules and
+  are loaded from `fp` at entry.
+
+### Spill and reload rules
+
+- **Prologue / late JIT entries**: all promoted locals are loaded from `fp` in
+  the function prologue before `entryLabel` dispatch, covering both initial
+  entry and VM-to-JIT re-entry.
+- **Calls and runtime helpers**: a callee never reads or writes the caller's
+  promoted slots (they are not address-taken), so nothing is reloaded after a
+  call and the locals stay in registers while a callee runs. Written promoted
+  locals are spilled to `fp` only where the frame is handed back to the VM:
+  before the `return;` that follows a script call whose callee did not return
+  normally, before the fallback call path, and before `asBC_Cast`.
+  Direct application calls spill only with `experimental_spill_on_native_calls`
+  (off by default): it keeps `GetVar` and `GetAddressOfVar` exact inside the
+  callee at about 10% on loops that call `array::opIndex`.
+- **Functions that are not promoted**: any function with `CALLINTF`, `CALLBND`
+  or `CallPtr` keeps its variables in the frame, because each of those calls
+  leaves compiled code and re-enters through a `JitEntry` that would reload
+  every promoted local.
+- **VM fallbacks and exceptions**: `emit_error_handlers` spills all written
+  promoted locals before `asea_set_internal_exception` in `err_*` handlers and
+  at `vm:` before returning to the VM (including `SUSPEND` when
+  `hack_ignore_suspend == false`). Error handlers and `emit_leave_system_call`
+  branch to `vm_after_spill:` so an exception after a system call cannot
+  overwrite frame edits made via `GetAddressOfVar`.
+- **Function return (`asBC_RET`)**: when `experimental_fast_script_return` is
+  false, `RET` falls back to `vm:` and spills; when true, the frame is popped
+  and dead locals are not spilled.
