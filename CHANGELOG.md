@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-27
+
 ### Added
 
 - JIT interface version 1 (`asIJITCompiler`): the JIT now runs on AngelScript 2.31.2 to 2.36.1 through `Jit::CompileFunction`, with `detail/compat.hpp` holding every difference between releases (`SetJITFunction`, `GetDeclaredAt`, `asINT32`, the call stack constants, `onHeap`, the composite and generic call properties). Speed-ups over the interpreter match 2.39's (`loops` x20-32, `fib` x2.2-3.4, `matmul` x5-7) and the differential corpus passes on Windows x64 from 2.31.2 to 2.36.1 and on Linux x64 with 2.35.1. 2.30.2 and earlier do not build.
@@ -26,7 +28,14 @@
   - `try_spilled_reg_mem` overflowed its operand array when one pseudo register appeared three times in an instruction (`xors t, t, t`), and left a stale operand behind, so `x ^ x`, `x + x` and `x - x` returned a wrong value;
   - the aarch64 assertion macro now prints the line before aborting.
 
-## [0.2.0]
+### Changed
+
+- Restructured the README and moved `ROADMAP.md` to `docs/ROADMAP.md`.
+
+---
+**Full Changelog**: https://github.com/Gaftherman/angelscript-jit/compare/v0.2.0...v0.3.0
+
+## [0.2.0] - 2026-11-25
 
 ### Added
 
@@ -46,6 +55,9 @@
 
 - The upstream questions and answers moved to `docs/DESIGN.md`, and `doc/TESTS.md` to `docs/TESTS.md`.
 - CI builds only `main` and pull requests, skips documentation-only changes, cancels superseded runs and caches the downloaded SDKs.
+
+---
+**Full Changelog**: https://github.com/Gaftherman/angelscript-jit/compare/v0.1.0...v0.2.0
 
 ## [0.1.0] - 2026-11-25
 
