@@ -48,7 +48,7 @@ Tunables, per-function callbacks and the thread-safety limit are in [docs/USAGE.
 ## Building from source
 
 ```bash
-git clone --recurse-submodules https://github.com/Gaftherman/angelscript-jit.git
+git clone --recurse-submodules https://github.com/angelscript-tools/angelscript-jit.git
 cd angelscript-jit
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -77,17 +77,17 @@ The full list is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Support
 
-Open an [issue](https://github.com/Gaftherman/angelscript-jit/issues) with the AngelScript release, the platform and a short script that reproduces it. Problems of the executable go to [angelscript-cli](https://github.com/Gaftherman/angelscript-cli/issues). To help, read [CONTRIBUTING.md](CONTRIBUTING.md).
+Open an [issue](https://github.com/angelscript-tools/angelscript-jit/issues) with the AngelScript release, the platform and a short script that reproduces it. Problems of the executable go to [angelscript-cli](https://github.com/angelscript-tools/angelscript-cli/issues). To help, read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Related
 
 | Project | Use |
 | --- | --- |
-| [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) | Run, check and debug scripts from the terminal. Its JIT builds use this repository |
-| [angelscript-lsp](https://github.com/Gaftherman/angelscript-lsp) | Editor support for VS Code |
-| [angelscript-dap](https://github.com/Gaftherman/angelscript-dap) | Debugger core |
-| [angelscript-engine](https://github.com/Gaftherman/angelscript-engine) | Patched SDK builds of older AngelScript releases |
-| [angelscript-debugger-example](https://github.com/Gaftherman/angelscript-debugger-example) | A host that shows how to use the debugger |
+| [angelscript-cli](https://github.com/angelscript-tools/angelscript-cli) | Run, check and debug scripts from the terminal. Its JIT builds use this repository |
+| [angelscript-lsp](https://github.com/angelscript-tools/angelscript-lsp) | Editor support for VS Code |
+| [angelscript-dap](https://github.com/angelscript-tools/angelscript-dap) | Debugger core |
+| [angelscript-engine](https://github.com/angelscript-tools/angelscript-engine) | Patched SDK builds of older AngelScript releases |
+| [angelscript-debugger-example](https://github.com/angelscript-tools/angelscript-debugger-example) | A host that shows how to use the debugger |
 
 ### Similar projects
 

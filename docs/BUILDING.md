@@ -5,7 +5,7 @@
 Clone the repository:
 
 ```bash
-git clone --recurse-submodules https://github.com/Gaftherman/angelscript-jit.git
+git clone --recurse-submodules https://github.com/angelscript-tools/angelscript-jit.git
 cd angelscript-jit
 ```
 
@@ -13,7 +13,7 @@ Or vendor it as a Git submodule of your repository:
 
 ```bash
 cd whatever/vendor/directory/
-git submodule add https://github.com/Gaftherman/angelscript-jit.git
+git submodule add https://github.com/angelscript-tools/angelscript-jit.git
 ```
 
 **Example project:** [`example/hello/`](../example/hello)

@@ -33,7 +33,7 @@
 - Restructured the README and moved `ROADMAP.md` to `docs/ROADMAP.md`.
 
 ---
-**Full Changelog**: https://github.com/Gaftherman/angelscript-jit/compare/v0.2.0...v0.3.0
+**Full Changelog**: https://github.com/angelscript-tools/angelscript-jit/compare/v0.2.0...v0.3.0
 
 ## [0.2.0] - 2026-11-25
 
@@ -57,7 +57,7 @@
 - CI builds only `main` and pull requests, skips documentation-only changes, cancels superseded runs and caches the downloaded SDKs.
 
 ---
-**Full Changelog**: https://github.com/Gaftherman/angelscript-jit/compare/v0.1.0...v0.2.0
+**Full Changelog**: https://github.com/angelscript-tools/angelscript-jit/compare/v0.1.0...v0.2.0
 
 ## [0.1.0] - 2026-11-25
 

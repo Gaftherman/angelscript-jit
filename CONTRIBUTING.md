@@ -6,7 +6,7 @@ Thank you for helping. Bug reports, fixes, tests and documentation are all welco
 
 ## Report a problem
 
-Open an [issue](https://github.com/Gaftherman/angelscript-jit/issues) with the AngelScript release, your operating system and architecture, the compiler, and the script that fails. If the same script runs correctly on the interpreter, say so: that is a JIT bug. `tests/differential` shows how to compare both.
+Open an [issue](https://github.com/angelscript-tools/angelscript-jit/issues) with the AngelScript release, your operating system and architecture, the compiler, and the script that fails. If the same script runs correctly on the interpreter, say so: that is a JIT bug. `tests/differential` shows how to compare both.
 
 A problem in MIR itself, or one that also happens in [asumagic/angelsea](https://github.com/asumagic/angelsea), is best reported there too.
 
@@ -20,7 +20,7 @@ A problem in MIR itself, or one that also happens in [asumagic/angelsea](https:/
 ## Build and test
 
 ~~~sh
-git clone --recurse-submodules https://github.com/Gaftherman/angelscript-jit.git
+git clone --recurse-submodules https://github.com/angelscript-tools/angelscript-jit.git
 cd angelscript-jit
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DASEA_ENABLE_TESTING=ON
 cmake --build build
@@ -28,7 +28,7 @@ cmake --build build
 ctest --test-dir build/tests -R differential --output-on-failure
 ~~~
 
-To test another AngelScript release, point `ASEA_ANGELSCRIPT_ROOT` at an SDK folder (the one that holds `angelscript/` and `add_on/`). [angelscript-engine](https://github.com/Gaftherman/angelscript-engine) prepares the older releases with `scripts/prepare-sdk.py`.
+To test another AngelScript release, point `ASEA_ANGELSCRIPT_ROOT` at an SDK folder (the one that holds `angelscript/` and `add_on/`). [angelscript-engine](https://github.com/angelscript-tools/angelscript-engine) prepares the older releases with `scripts/prepare-sdk.py`.
 
 Before sending a change to the code generator, run the generated corpus too:
 
@@ -52,6 +52,6 @@ By contributing you agree that your work is released under the [BSD-2-Clause Lic
 
 | Project | Use |
 | --- | --- |
-| [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) | Run, check and debug scripts from the terminal |
-| [angelscript-engine](https://github.com/Gaftherman/angelscript-engine) | Patched SDK builds of older AngelScript releases |
-| [angelscript-lsp](https://github.com/Gaftherman/angelscript-lsp) | Editor support for VS Code |
+| [angelscript-cli](https://github.com/angelscript-tools/angelscript-cli) | Run, check and debug scripts from the terminal |
+| [angelscript-engine](https://github.com/angelscript-tools/angelscript-engine) | Patched SDK builds of older AngelScript releases |
+| [angelscript-lsp](https://github.com/angelscript-tools/angelscript-lsp) | Editor support for VS Code |

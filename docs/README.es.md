@@ -48,7 +48,7 @@ Los parámetros, las funciones de configuración por función y el límite de hi
 ## Compilar desde el código fuente
 
 ```bash
-git clone --recurse-submodules https://github.com/Gaftherman/angelscript-jit.git
+git clone --recurse-submodules https://github.com/angelscript-tools/angelscript-jit.git
 cd angelscript-jit
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -77,17 +77,17 @@ La lista completa está en [ROADMAP.md](ROADMAP.md).
 
 ## Soporte
 
-Abre una [incidencia](https://github.com/Gaftherman/angelscript-jit/issues) con la versión de AngelScript, la plataforma y un script corto que reproduzca el problema. Los problemas del ejecutable van a [angelscript-cli](https://github.com/Gaftherman/angelscript-cli/issues). Para colaborar, lee [CONTRIBUTING.es.md](CONTRIBUTING.es.md).
+Abre una [incidencia](https://github.com/angelscript-tools/angelscript-jit/issues) con la versión de AngelScript, la plataforma y un script corto que reproduzca el problema. Los problemas del ejecutable van a [angelscript-cli](https://github.com/angelscript-tools/angelscript-cli/issues). Para colaborar, lee [CONTRIBUTING.es.md](CONTRIBUTING.es.md).
 
 ## Relacionados
 
 | Proyecto | Uso |
 | --- | --- |
-| [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) | Ejecuta, comprueba y depura scripts desde la terminal. Sus compilaciones con JIT usan este repositorio |
-| [angelscript-lsp](https://github.com/Gaftherman/angelscript-lsp) | Soporte del editor para VS Code |
-| [angelscript-dap](https://github.com/Gaftherman/angelscript-dap) | Núcleo del depurador |
-| [angelscript-engine](https://github.com/Gaftherman/angelscript-engine) | Compilaciones del SDK parcheado de versiones anteriores de AngelScript |
-| [angelscript-debugger-example](https://github.com/Gaftherman/angelscript-debugger-example) | Una aplicación que muestra cómo usar el depurador |
+| [angelscript-cli](https://github.com/angelscript-tools/angelscript-cli) | Ejecuta, comprueba y depura scripts desde la terminal. Sus compilaciones con JIT usan este repositorio |
+| [angelscript-lsp](https://github.com/angelscript-tools/angelscript-lsp) | Soporte del editor para VS Code |
+| [angelscript-dap](https://github.com/angelscript-tools/angelscript-dap) | Núcleo del depurador |
+| [angelscript-engine](https://github.com/angelscript-tools/angelscript-engine) | Compilaciones del SDK parcheado de versiones anteriores de AngelScript |
+| [angelscript-debugger-example](https://github.com/angelscript-tools/angelscript-debugger-example) | Una aplicación que muestra cómo usar el depurador |
 
 ### Proyectos similares
 

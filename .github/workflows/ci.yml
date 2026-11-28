@@ -65,7 +65,7 @@ jobs:
         if: matrix.angelscript != '2.39.0'
         shell: bash
         run: |
-          git clone --depth 1 --branch v0.1.0 https://github.com/Gaftherman/angelscript-engine "$RUNNER_TEMP/engine"
+          git clone --depth 1 --branch v0.1.0 https://github.com/angelscript-tools/angelscript-engine "$RUNNER_TEMP/engine"
           sdk=$(python "$RUNNER_TEMP/engine/scripts/prepare-sdk.py" ${{ matrix.angelscript }} --out "$RUNNER_TEMP/sdk" --cache "$RUNNER_TEMP/sdk-cache")
           echo "SDK_ARG=-DASEA_ANGELSCRIPT_ROOT=$sdk" >> "$GITHUB_ENV"
       - name: Configure

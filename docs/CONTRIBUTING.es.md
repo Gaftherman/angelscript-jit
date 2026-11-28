@@ -6,7 +6,7 @@ Gracias por ayudar. Los informes de errores, las correcciones, las pruebas y la 
 
 ## Informar de un problema
 
-Abre una [incidencia](https://github.com/Gaftherman/angelscript-jit/issues) con la versión de AngelScript, tu sistema operativo y arquitectura, el compilador y el script que falla. Si el mismo script funciona bien en el intérprete, indícalo: es un error del JIT. `tests/differential` muestra cómo comparar ambos.
+Abre una [incidencia](https://github.com/angelscript-tools/angelscript-jit/issues) con la versión de AngelScript, tu sistema operativo y arquitectura, el compilador y el script que falla. Si el mismo script funciona bien en el intérprete, indícalo: es un error del JIT. `tests/differential` muestra cómo comparar ambos.
 
 Un problema del propio MIR, o que también ocurra en [asumagic/angelsea](https://github.com/asumagic/angelsea), conviene informarlo también allí.
 
@@ -20,7 +20,7 @@ Un problema del propio MIR, o que también ocurra en [asumagic/angelsea](https:/
 ## Compilar y probar
 
 ~~~sh
-git clone --recurse-submodules https://github.com/Gaftherman/angelscript-jit.git
+git clone --recurse-submodules https://github.com/angelscript-tools/angelscript-jit.git
 cd angelscript-jit
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DASEA_ENABLE_TESTING=ON
 cmake --build build
@@ -28,7 +28,7 @@ cmake --build build
 ctest --test-dir build/tests -R differential --output-on-failure
 ~~~
 
-Para probar otra versión de AngelScript, apunta `ASEA_ANGELSCRIPT_ROOT` a una carpeta de SDK (la que contiene `angelscript/` y `add_on/`). [angelscript-engine](https://github.com/Gaftherman/angelscript-engine) prepara las versiones anteriores con `scripts/prepare-sdk.py`.
+Para probar otra versión de AngelScript, apunta `ASEA_ANGELSCRIPT_ROOT` a una carpeta de SDK (la que contiene `angelscript/` y `add_on/`). [angelscript-engine](https://github.com/angelscript-tools/angelscript-engine) prepara las versiones anteriores con `scripts/prepare-sdk.py`.
 
 Antes de enviar un cambio al generador de código, ejecuta también el corpus generado:
 
@@ -52,6 +52,6 @@ Al contribuir aceptas que tu trabajo se publique con la [licencia BSD-2-Clause](
 
 | Proyecto | Uso |
 | --- | --- |
-| [angelscript-cli](https://github.com/Gaftherman/angelscript-cli) | Ejecuta, comprueba y depura scripts desde la terminal |
-| [angelscript-engine](https://github.com/Gaftherman/angelscript-engine) | Compilaciones del SDK parcheado de versiones anteriores de AngelScript |
-| [angelscript-lsp](https://github.com/Gaftherman/angelscript-lsp) | Compatibilidad de editor con VS Code |
+| [angelscript-cli](https://github.com/angelscript-tools/angelscript-cli) | Ejecuta, comprueba y depura scripts desde la terminal |
+| [angelscript-engine](https://github.com/angelscript-tools/angelscript-engine) | Compilaciones del SDK parcheado de versiones anteriores de AngelScript |
+| [angelscript-lsp](https://github.com/angelscript-tools/angelscript-lsp) | Compatibilidad de editor con VS Code |
