@@ -24,7 +24,7 @@ Dependencias obligatorias:
 
 - [**AngelScript**](https://www.angelcode.com/angelscript/) v2.37.0 o posterior (la interfaz `asIJITCompilerV2`; las versiones 2.31.2 a 2.36.1 usan la interfaz V1).
 - [**fmt**](https://github.com/fmtlib/fmt).
-- [**MIR**](https://github.com/vnmakarov/mir) v1.0, de un [fork derivado](https://github.com/asumagic/mir) (consulta la advertencia). No hace falta en destinos de 32 bits (`ASEA_NO_MIR`).
+- [**MIR**](https://github.com/vnmakarov/mir) v1.0, de un [fork derivado](https://github.com/angelscript-tools/mir) (consulta la advertencia). No hace falta en destinos de 32 bits (`ASEA_NO_MIR`).
 
 Opcionales: [**Catch2**](https://github.com/catchorg/Catch2/tree/devel) para las pruebas y [**nanobench**](https://github.com/martinus/nanobench/) para los benchmarks.
 
